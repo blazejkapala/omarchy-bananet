@@ -16,7 +16,7 @@ degrades gracefully, and tells you what one command would unlock.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/USER/omarchy-bananet.git --enable
+omarchy plugin add https://github.com/blazejkapala/omarchy-bananet.git --enable
 omarchy bar move banan.bananet --before omarchy.tailscale   # optional placement
 ```
 
