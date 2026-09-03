@@ -2,10 +2,11 @@
 
 **Where does your traffic go?** An [Omarchy](https://omarchy.org) bar widget
 that shows **where this machine's traffic really exits**: active networks and tunnels (Wi‑Fi, Ethernet,
-Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN), live
-throughput with 24 h charts, routes, DNS, and **which services (processes)
-talk to which addresses over which tunnel**. No root required; everything
-degrades gracefully and tells you what one command would unlock.
+Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN), **your
+public IP and who owns it**, live throughput with 24 h charts, routes, DNS,
+and **which services (processes) talk to which addresses over which tunnel**.
+No root required; the widget detects what is installed and only uses that,
+degrades gracefully, and tells you what one command would unlock.
 
 <p align="center">
   <img src="screenshots/panel.png" width="49%" alt="Panel: egress, interfaces with sparklines, services">
@@ -40,9 +41,18 @@ when the content does not fit.
   <img src="screenshots/panel-services.png" width="49%" alt="Services expanded: remote addresses per process and interface">
 </p>
 
+Colours follow the active Omarchy theme, light or dark:
+
+<p align="center">
+  <img src="screenshots/panel-light.png" width="49%" alt="The same panel on Catppuccin Latte (light theme)">
+</p>
+
 - *Egress* — IPv4/IPv6 default route (honours policy routing, so a Tailscale
   exit node or a ZeroTier `allowDefault` show up truthfully), current DNS
-  resolver, warnings.
+  resolver, **public IP** (IPv4 / IPv6) with the owning network, city and
+  country, warnings. The public address is checked every 5 minutes, when the
+  egress route changes, and on manual refresh (`r`); a failed check keeps the
+  last answer marked *stale* instead of pretending.
 - *Interfaces & tunnels* — one row per interface: kind, network/tailnet name,
   IP, gateway, Wi‑Fi signal, connection count, a sparkline and live ↓/↑ rates.
   Hover = tooltip with details; click/Enter = expand: **traffic chart over
@@ -90,6 +100,7 @@ when the content does not fit.
 | `iconStyle` | `banana` | bar icon: `banana`, `emoji`, `globe` |
 | `showLabel` | false | `wifi +2` label next to the icon |
 | `showTooltip` | false | summary tooltip on hover |
+| `publicIp` | true | check the public IP and its owner (icanhazip.com + ipinfo.io), see *Privacy* |
 | `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-bananet/`) |
 | `useSudo` | true | try `sudo -n` for `wg`, `zerotier-cli`, `ss` (passwordless only; answer remembered 10 min) |
 | `showInactive` | true | list interfaces that are down (e.g. Ethernet without a cable) |
@@ -101,6 +112,11 @@ when the content does not fit.
 Example: `omarchy bar set banan.bananet labels '{"wg0":"MikroTik BTH"}' --json`
 
 ## Privileges — what works without root and what needs one step
+
+The collector first detects what is installed (`tailscale`, `zerotier-cli`,
+`wg`, `openvpn`, `nmcli`, `resolvectl`, `ss`) and only uses those tools; the
+panel footer lists what it found. Nothing is suggested for a tool that is not
+there, so a machine without WireGuard never sees a WireGuard setup card.
 
 Everything basic (interfaces, routes, counters, DNS, Tailscale, connections
 of your own processes) works without root. Three things need a one-time setup.
@@ -171,10 +187,18 @@ omarchy-shell banan.bananet refresh
 
 ## Privacy
 
-Everything runs locally. The only network activity the widget itself causes is
-optional reverse DNS for remote addresses (`resolveNames`), which goes through
-your normal resolver. The screenshots above were taken in demo mode with
-synthetic data.
+Everything runs locally except two optional lookups:
+
+- **Public IP** (`publicIp`, on by default): `https://ipv4.icanhazip.com` and
+  `https://ipv6.icanhazip.com` return the address, then `https://ipinfo.io/<ip>/json`
+  tells who owns it (organisation, city, country). This happens at most every
+  5 minutes, when the egress route changes, or on manual refresh, never on every
+  tick; the answer is cached in `~/.cache/omarchy-bananet/public.json`. Set
+  `publicIp` to `false` to never contact these services.
+- **Reverse DNS** for remote addresses (`resolveNames`), which goes through
+  your normal resolver.
+
+The screenshots above were taken in demo mode with synthetic data.
 
 ## License
 

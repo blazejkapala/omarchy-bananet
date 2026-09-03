@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "banan",
   "license": "MIT",
-  "description": "Bananet — where does your traffic go? Networks, tunnels, egress route and per-service connections in the Omarchy bar: Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN, live throughput with 24 h charts, routes, DNS, and which services talk to which addresses over which link.",
+  "description": "Bananet — where does your traffic go? Networks, tunnels, egress route and per-service connections in the Omarchy bar: Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN, public IP and its owner, live throughput with 24 h charts, routes, DNS, and which services talk to which addresses over which link.",
   "kinds": [
     "bar-widget"
   ],
@@ -28,7 +28,9 @@
       "showLoopback": false,
       "showTooltip": false,
       "iconStyle": "banana",
-      "demo": false
+      "demo": false,
+      "showVirtual": false,
+      "publicIp": true
     },
     "schema": [
       {
@@ -68,6 +70,12 @@
         "defaultValue": false
       },
       {
+        "key": "publicIp",
+        "type": "boolean",
+        "label": "Check the public IP and its owner (icanhazip.com + ipinfo.io, every 5 min or when the route changes)",
+        "defaultValue": true
+      },
+      {
         "key": "resolveNames",
         "type": "boolean",
         "label": "Resolve remote host names (reverse DNS, cached)",
@@ -84,6 +92,12 @@
         "type": "boolean",
         "label": "List interfaces that are down",
         "defaultValue": true
+      },
+      {
+        "key": "showVirtual",
+        "type": "boolean",
+        "label": "List bridges / veth (Docker, libvirt)",
+        "defaultValue": false
       },
       {
         "key": "showLoopback",

@@ -22,12 +22,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 
 HOME = os.path.expanduser("~")
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "omarchy-bananet")
 RDNS_CACHE = os.path.join(CACHE_DIR, "rdns.json")
 SUDO_CACHE = os.path.join(CACHE_DIR, "sudo.json")
 HISTORY_FILE = os.path.join(CACHE_DIR, "history.jsonl")
+PUBLIC_CACHE = os.path.join(CACHE_DIR, "public.json")
+PUBLIC_TTL = 300           # seconds between public-IP checks (also re-checked when the egress route changes)
 HISTORY_STEP = 30          # seconds between stored samples
 HISTORY_KEEP = 24 * 3600   # seconds of history to keep
 
@@ -40,6 +43,8 @@ OPTS = {
     "loopback": False,
     "history": False,
     "demo": False,
+    "public": True,
+    "public_now": False,
 }
 
 WELL_KNOWN_PORTS = {
@@ -582,6 +587,99 @@ def collect_openvpn(links, active_conns):
     return result
 
 
+# --------------------------------------------------------------------------- tools / public IP
+
+TOOLS = (
+    ("tailscale", "Tailscale"),
+    ("zerotier-cli", "ZeroTier"),
+    ("wg", "WireGuard (wireguard-tools)"),
+    ("openvpn", "OpenVPN"),
+    ("nmcli", "NetworkManager"),
+    ("resolvectl", "systemd-resolved"),
+    ("ss", "sockets (iproute2)"),
+)
+
+
+def collect_tools():
+    """What is installed on this machine. The panel adapts to this list: nothing
+    is asked of the user for a tool that is simply not there."""
+    out = []
+    for name, label in TOOLS:
+        out.append({"name": name, "label": label, "found": bool(which(name))})
+    return out
+
+
+def http_get(url, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": "omarchy-bananet/1.0", "Accept": "application/json, text/plain"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace").strip()
+
+
+def collect_public(egress4, egress6, exit_node):
+    """Public address as seen from the internet, plus who owns it (ipinfo.io).
+    Checked at most every PUBLIC_TTL seconds or when the egress route changes,
+    so the widget does not talk to the outside world on every refresh."""
+    if not OPTS["public"]:
+        return None
+    via = {
+        "dev": (egress4 or egress6 or {}).get("dev", ""),
+        "gateway": (egress4 or egress6 or {}).get("gateway", ""),
+        "src": (egress4 or egress6 or {}).get("src", ""),
+        "exitNode": (exit_node or {}).get("name", "") if exit_node else "",
+    }
+    key = "|".join(via[k] for k in ("dev", "gateway", "src", "exitNode"))
+    cache = load_json_file(PUBLIC_CACHE, {})
+    now = time.time()
+    if not egress4 and not egress6:
+        return {"available": False, "reason": "no default route", "via": via, "geo": cache.get("geo") or {}}
+    fresh = cache.get("key") == key and now - cache.get("checkedAt", 0) < PUBLIC_TTL and bool(cache.get("v4") or cache.get("v6"))
+    if fresh and not OPTS["public_now"]:
+        cache["stale"] = False
+        cache["available"] = True
+        return cache
+
+    results = {}
+
+    def fetch(name, url):
+        try:
+            text = http_get(url, 3.0)
+            if re.match(r"^[0-9a-fA-F.:]+$", text):
+                results[name] = text
+        except Exception as e:  # noqa: BLE001 - network errors are expected (no IPv6, offline)
+            results[name + "_err"] = str(e).split("\n")[0][:120]
+
+    threads = [threading.Thread(target=fetch, args=("v4", "https://ipv4.icanhazip.com")),
+               threading.Thread(target=fetch, args=("v6", "https://ipv6.icanhazip.com"))]
+    for t in threads:
+        t.daemon = True
+        t.start()
+    for t in threads:
+        t.join(3.5)
+    v4 = results.get("v4")
+    v6 = results.get("v6")
+    if not v4 and not v6:
+        # Offline or blocked: keep the last known answer, mark it stale.
+        old = dict(cache) if cache.get("v4") or cache.get("v6") else {}
+        old.update({"available": bool(old.get("v4") or old.get("v6")), "stale": True, "via": via,
+                    "error": results.get("v4_err") or results.get("v6_err") or "no answer", "lastTry": now})
+        return old
+    geo_cache = cache.get("geo") or {}
+    geo_ip = v4 or v6
+    geo = geo_cache.get(geo_ip)
+    if geo is None:
+        geo = {}
+        try:
+            data = json.loads(http_get("https://ipinfo.io/%s/json" % geo_ip, 3.0))
+            geo = {k: data.get(k, "") for k in ("hostname", "city", "region", "country", "org", "timezone")}
+        except Exception as e:  # noqa: BLE001
+            geo = {"error": str(e).split("\n")[0][:120]}
+        geo_cache = {geo_ip: geo}  # keep only the current one; IPs change rarely
+    out = {"available": True, "stale": False, "v4": v4, "v6": v6, "key": key, "via": via,
+           "checkedAt": now, "geo": geo_cache, "info": geo}
+    save_json_file(PUBLIC_CACHE, out)
+    return out
+
+
 # --------------------------------------------------------------------------- sockets
 
 def parse_ss(text, listening=False):
@@ -836,6 +934,10 @@ def demo_output(now):
         "interfaces": interfaces, "tunnelsActive": 3, "connections": connections, "otherStates": 2, "processes": process_list,
         "listeners": listeners, "rules": [], "tailscale": tailscale, "zerotier": {"installed": True, "available": True, "networks": [zt_net], "peers": zt_peers, "rootCount": 4, "rootsDirect": 3},
         "warnings": [], "setup": [], "history": history if OPTS["history"] else None, "historyStep": HISTORY_STEP,
+        "tools": [{"name": n, "label": l, "found": n not in ("openvpn",)} for n, l in TOOLS],
+        "public": {"available": True, "stale": False, "v4": "203.0.113.42", "v6": None, "checkedAt": now - 95,
+                   "via": {"dev": "wlp2s0", "gateway": "192.168.1.1", "src": "192.168.1.42", "exitNode": ""},
+                   "info": {"hostname": "cpe-203-0-113-42.example-isp.net", "city": "Warsaw", "region": "Mazovia", "country": "PL", "org": "AS64496 Example ISP", "timezone": "Europe/Warsaw"}},
     }
 
 
@@ -856,6 +958,10 @@ def main():
             OPTS["history"] = True
         elif a == "--demo":
             OPTS["demo"] = True
+        elif a == "--no-public":
+            OPTS["public"] = False
+        elif a == "--public-now":
+            OPTS["public_now"] = True
         elif a == "--max-rdns" and i + 1 < len(args):
             OPTS["max_rdns"] = int(args[i + 1]); i += 1
         elif a == "--labels" and i + 1 < len(args):
@@ -1125,6 +1231,8 @@ def main():
         "zerotier": zerotier,
         "warnings": WARNINGS,
         "setup": SETUP,
+        "tools": collect_tools(),
+        "public": collect_public(egress4, egress6, (tailscale or {}).get("exitNode")),
         "history": history,
         "historyStep": HISTORY_STEP,
     }

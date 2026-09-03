@@ -74,6 +74,8 @@ Panel {
   readonly property bool showInactive: boolSetting("showInactive", true)
   readonly property bool showVirtual: boolSetting("showVirtual", false)
   readonly property bool showLoopback: boolSetting("showLoopback", false)
+  readonly property bool publicIp: boolSetting("publicIp", true)
+  property bool forcePublic: false     // next refresh re-checks the public IP now (manual refresh)
   readonly property var labelOverrides: {
     var v = setting("labels", null)
     return (v && typeof v === "object") ? v : {}
@@ -99,6 +101,29 @@ Panel {
 
   readonly property var egress: snap && snap.egress ? snap.egress : {}
   readonly property var egress4: egress.v4 || null
+  readonly property var pub: snap && snap.public ? snap.public : null
+  readonly property var tools: snap && snap.tools ? snap.tools : []
+  readonly property string publicText: {
+    if (!pub) return ""
+    if (!pub.available) return pub.error ? "unreachable (" + pub.error + ")" : (pub.reason || "unknown")
+    var parts = []
+    if (pub.v4) parts.push(pub.v4)
+    if (pub.v6) parts.push(pub.v6)
+    var g = pub.info || {}
+    var who = []
+    if (g.org) who.push(g.org)
+    if (g.city || g.country) who.push([g.city, g.country].filter(function(x) { return !!x }).join(", "))
+    if (g.hostname) who.push(g.hostname)
+    var out = parts.join("  /  ") + (who.length ? "  ·  " + who.join(" · ") : "")
+    if (pub.stale) out += "  (stale, last check failed)"
+    return out
+  }
+  readonly property string toolsText: {
+    var found = [], missing = []
+    for (var i = 0; i < tools.length; i++) (tools[i].found ? found : missing).push(tools[i].name)
+    if (found.length === 0 && missing.length === 0) return ""
+    return "detected: " + found.join(" · ") + (missing.length ? "   ·   not installed: " + missing.join(" · ") : "")
+  }
   readonly property var egress6: egress.v6 || null
   readonly property int tunnelsActive: snap && snap.tunnelsActive ? snap.tunnelsActive : 0
   readonly property var defaultIface: {
@@ -181,6 +206,8 @@ Panel {
     if (!useSudo) args.push("--no-sudo")
     if (showLoopback) args.push("--loopback")
     if (opened) args.push("--history")
+    if (!publicIp) args.push("--no-public")
+    if (forcePublic) { args.push("--public-now"); forcePublic = false }
     if (boolSetting("demo", false)) args.push("--demo")
     var keys = Object.keys(labelOverrides)
     if (keys.length > 0) { args.push("--labels"); args.push(JSON.stringify(labelOverrides)) }
@@ -349,6 +376,7 @@ Panel {
       lines.push("Internet → " + egress4.dev + (d ? " (" + d.label + ")" : "") + (egress4.gateway ? " via " + egress4.gateway : ""))
     } else lines.push("Internet → no default route")
     if (egress.exitNode && egress.exitNode.name) lines.push("Tailscale exit node: " + egress.exitNode.name)
+    if (pub && pub.available) lines.push("Public IP: " + (pub.v4 || pub.v6 || "?") + ((pub.info || {}).org ? " · " + pub.info.org : "") + (pub.stale ? " (stale)" : ""))
     var list = snap.interfaces || []
     for (var i = 0; i < list.length; i++) {
       var f = list[i]
@@ -877,7 +905,7 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "r") root.refresh()
+        if (t === "r") { root.forcePublic = true; root.refresh() }
         else if (t === "c") root.copyCursor()
         else if (t === "l") root.showListeners = !root.showListeners
         else if (t === "e") root.setAllExpanded(true)
@@ -932,6 +960,7 @@ Panel {
             InfoLine { label: "IPv6"; value: root.egress6 ? (root.egress6.dev + (root.egress6.gateway ? " → " + root.egress6.gateway : "") + (root.egress6.src ? "  from " + root.egress6.src : "")) : "no route (IPv4 only)"; dimValue: !root.egress6 }
             InfoLine { visible: !!root.egress.exitNode; label: "Exit"; value: root.egress.exitNode ? ("Tailscale exit node " + (root.egress.exitNode.name || (root.egress.exitNode.ips || []).join(",")) + (root.egress.exitNode.online ? "" : " — OFFLINE")) : ""; urgentValue: root.egress.exitNode ? !root.egress.exitNode.online : false }
             InfoLine { label: "DNS"; value: root.egress.dns && root.egress.dns.length ? root.egress.dns.join(", ") + (root.egress.dnsDev ? "  via " + root.egress.dnsDev : "") : (root.loaded ? "none" : "…") }
+            InfoLine { visible: root.publicIp; label: "Public"; value: root.pub ? root.publicText : (root.loaded ? "checking…" : "…"); dimValue: !root.pub || !root.pub.available || !!root.pub.stale; urgentValue: !!(root.pub && root.pub.available === false && root.pub.error) }
 
             Repeater {
               model: JSON.parse(root.warningsJson)
@@ -1159,6 +1188,16 @@ Panel {
             Text {
               width: parent.width
               text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · r refresh · l listeners · e/w expand/collapse all · esc"
+              color: root.dimmer
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              visible: root.toolsText !== ""
+              width: parent.width
+              text: root.toolsText
               color: root.dimmer
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
