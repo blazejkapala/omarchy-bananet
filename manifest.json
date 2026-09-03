@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "id": "banan.tunnels",
+  "name": "Tunnels",
+  "version": "1.0.0",
+  "author": "banan",
+  "license": "MIT",
+  "description": "Where does this machine's traffic really go? Active networks and tunnels (Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN), live throughput with 24 h charts, egress route, DNS, and which services talk to which addresses over which tunnel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Tunnels",
+    "description": "Active networks and tunnels, live throughput, egress route, and per-service connections. Hover for a summary, click for the full panel.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "openRefreshIntervalSec": 2,
+      "showLabel": false,
+      "resolveNames": true,
+      "useSudo": true,
+      "showInactive": true,
+      "showLoopback": false,
+      "showTooltip": false,
+      "iconStyle": "banana",
+      "demo": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval when closed (seconds)",
+        "min": 2,
+        "max": 600,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "openRefreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval while panel is open (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 2
+      },
+      {
+        "key": "showLabel",
+        "type": "boolean",
+        "label": "Show egress label next to the icon (e.g. \"wifi +2\")",
+        "defaultValue": false
+      },
+      {
+        "key": "iconStyle",
+        "type": "string",
+        "label": "Bar icon: banana, emoji, or globe",
+        "defaultValue": "banana"
+      },
+      {
+        "key": "showTooltip",
+        "type": "boolean",
+        "label": "Show summary tooltip on hover",
+        "defaultValue": false
+      },
+      {
+        "key": "resolveNames",
+        "type": "boolean",
+        "label": "Resolve remote host names (reverse DNS, cached)",
+        "defaultValue": true
+      },
+      {
+        "key": "useSudo",
+        "type": "boolean",
+        "label": "Try passwordless sudo for wg / zerotier-cli / ss",
+        "defaultValue": true
+      },
+      {
+        "key": "showInactive",
+        "type": "boolean",
+        "label": "List interfaces that are down",
+        "defaultValue": true
+      },
+      {
+        "key": "showLoopback",
+        "type": "boolean",
+        "label": "Include loopback connections in service lists",
+        "defaultValue": false
+      },
+      {
+        "key": "demo",
+        "type": "boolean",
+        "label": "Demo mode (synthetic data, for screenshots or trying it out)",
+        "defaultValue": false
+      }
+    ]
+  }
+}
