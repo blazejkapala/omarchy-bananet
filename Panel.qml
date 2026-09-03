@@ -6,7 +6,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// banan.tunnels — where does this machine's traffic go?
+// banan.bananet — Bananet: where does this machine's traffic go?
 //
 // Bar: glyph + short egress label ("wifi +2" = internet leaves over Wi-Fi,
 // two tunnels are up). Hover: one-screen summary. Click: full panel with
@@ -14,14 +14,14 @@ import qs.Ui
 // and listening services. All data comes from collect.py (no root needed).
 Panel {
   id: root
-  moduleName: "banan.tunnels"
-  ipcTarget: "banan.tunnels"
+  moduleName: "banan.bananet"
+  ipcTarget: "banan.bananet"
   manageIpc: false
 
-  // Own IPC handler so `omarchy-shell banan.tunnels <method>` also gets
+  // Own IPC handler so `omarchy-shell banan.bananet <method>` also gets
   // refresh/scrollTo (the base Panel only offers open/close/toggle).
   IpcHandler {
-    target: "banan.tunnels"
+    target: "banan.bananet"
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }
@@ -163,7 +163,7 @@ Panel {
       applySample(JSON.parse(raw))
     } catch (e) {
       lastError = "Could not parse collector output: " + e
-      console.warn("banan.tunnels", lastError)
+      console.warn("banan.bananet", lastError)
     }
   }
 
@@ -334,7 +334,7 @@ Panel {
     return fg
   }
   readonly property string barTooltip: {
-    if (!loaded) return "Networks & tunnels: collecting…"
+    if (!loaded) return "Bananet: collecting…"
     var lines = []
     if (egress4) {
       var d = defaultIface
@@ -905,7 +905,7 @@ Panel {
                 font.pixelSize: Style.font.display
               }
             }
-            title: "Networks & tunnels"
+            title: "Bananet"
             meta: root.egressLine
             detail: root.loaded ? (root.tunnelsActive > 0 ? root.plural(root.tunnelsActive, "tunnel", "tunnels") : "no tunnels") : ""
             foreground: root.foreground

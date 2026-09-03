@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Data collector for the banan.tunnels Omarchy bar widget.
+"""Data collector for the banan.bananet (Bananet) Omarchy bar widget.
 
 Prints one JSON document describing:
   * every network interface (Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard,
@@ -24,7 +24,7 @@ import threading
 import time
 
 HOME = os.path.expanduser("~")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "omarchy-tunnels")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "omarchy-bananet")
 RDNS_CACHE = os.path.join(CACHE_DIR, "rdns.json")
 SUDO_CACHE = os.path.join(CACHE_DIR, "sudo.json")
 HISTORY_FILE = os.path.join(CACHE_DIR, "history.jsonl")
@@ -527,7 +527,7 @@ def collect_wireguard(links, active_conns):
                 "id": "wireguard",
                 "title": "WireGuard: no access to `wg show`",
                 "detail": "Peers, endpoints and handshakes need root. Click to add a passwordless sudo rule for `wg show` only (asks for your password); right click copies the command.",
-                "command": "echo \"$USER ALL=(root) NOPASSWD: /usr/bin/wg show *\" | sudo tee /etc/sudoers.d/omarchy-tunnels-wg >/dev/null && echo OK",
+                "command": "echo \"$USER ALL=(root) NOPASSWD: /usr/bin/wg show *\" | sudo tee /etc/sudoers.d/omarchy-bananet-wg >/dev/null && echo OK",
                 "iface": "wireguard",
             })
     elif devs:
@@ -1092,7 +1092,7 @@ def main():
             "id": "ss",
             "title": "Root process names are guessed",
             "detail": "`ss -p` without root cannot see tailscaled, sshd etc. Optional: click to allow passwordless `sudo ss` (asks for your password); right click copies the command.",
-            "command": "echo \"$USER ALL=(root) NOPASSWD: /usr/bin/ss\" | sudo tee /etc/sudoers.d/omarchy-tunnels-ss >/dev/null && echo OK",
+            "command": "echo \"$USER ALL=(root) NOPASSWD: /usr/bin/ss\" | sudo tee /etc/sudoers.d/omarchy-bananet-ss >/dev/null && echo OK",
             "iface": "",
             "minor": True,
         })

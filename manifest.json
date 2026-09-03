@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "banan.tunnels",
-  "name": "Tunnels",
+  "id": "banan.bananet",
+  "name": "Bananet",
   "version": "1.0.0",
   "author": "banan",
   "license": "MIT",
-  "description": "Where does this machine's traffic really go? Active networks and tunnels (Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN), live throughput with 24 h charts, egress route, DNS, and which services talk to which addresses over which tunnel.",
+  "description": "Bananet — where does your traffic go? Networks, tunnels, egress route and per-service connections in the Omarchy bar: Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN, live throughput with 24 h charts, routes, DNS, and which services talk to which addresses over which link.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,8 +13,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Tunnels",
-    "description": "Active networks and tunnels, live throughput, egress route, and per-service connections. Hover for a summary, click for the full panel.",
+    "displayName": "Bananet",
+    "description": "Networks, tunnels, egress and per-service connections with 24 h charts. Click for the panel.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",

@@ -1,7 +1,7 @@
-# banan.tunnels — Networks & tunnels in the Omarchy bar
+# Bananet — networks, tunnels & egress in the Omarchy bar
 
-An [Omarchy](https://omarchy.org) bar widget that shows **where this machine's
-traffic really exits**: active networks and tunnels (Wi‑Fi, Ethernet,
+**Where does your traffic go?** An [Omarchy](https://omarchy.org) bar widget
+that shows **where this machine's traffic really exits**: active networks and tunnels (Wi‑Fi, Ethernet,
 Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN), live
 throughput with 24 h charts, routes, DNS, and **which services (processes)
 talk to which addresses over which tunnel**. No root required; everything
@@ -15,8 +15,8 @@ degrades gracefully and tells you what one command would unlock.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/USER/omarchy-tunnels.git --enable
-omarchy bar move banan.tunnels --before omarchy.tailscale   # optional placement
+omarchy plugin add https://github.com/USER/omarchy-bananet.git --enable
+omarchy bar move banan.bananet --before omarchy.tailscale   # optional placement
 ```
 
 Requirements: Omarchy 4.x (Quickshell bar), `python3`, `iproute2`, `nmcli`,
@@ -81,7 +81,7 @@ when the content does not fit.
 | Close | Esc |
 | Switch to a neighbouring bar panel | Tab / Shift+Tab |
 
-## Settings (`~/.config/omarchy/shell.json`, the `banan.tunnels` entry)
+## Settings (`~/.config/omarchy/shell.json`, the `banan.bananet` entry)
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -90,7 +90,7 @@ when the content does not fit.
 | `iconStyle` | `banana` | bar icon: `banana`, `emoji`, `globe` |
 | `showLabel` | false | `wifi +2` label next to the icon |
 | `showTooltip` | false | summary tooltip on hover |
-| `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-tunnels/`) |
+| `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-bananet/`) |
 | `useSudo` | true | try `sudo -n` for `wg`, `zerotier-cli`, `ss` (passwordless only; answer remembered 10 min) |
 | `showInactive` | true | list interfaces that are down (e.g. Ethernet without a cable) |
 | `showVirtual` | false | list bridges/veth (Docker etc.) |
@@ -98,7 +98,7 @@ when the content does not fit.
 | `demo` | false | synthetic data instead of the real system (screenshots, trying it out) |
 | `labels` | `{}` | custom names, e.g. `{"wg0": "MikroTik BTH home"}` |
 
-Example: `omarchy bar set banan.tunnels labels '{"wg0":"MikroTik BTH"}' --json`
+Example: `omarchy bar set banan.bananet labels '{"wg0":"MikroTik BTH"}' --json`
 
 ## Privileges — what works without root and what needs one step
 
@@ -120,7 +120,7 @@ privileges* section. The same commands for manual use:
    takes peers from NetworkManager if the tunnel is configured there. For full
    data:
    ```bash
-   echo "$USER ALL=(root) NOPASSWD: /usr/bin/wg show *" | sudo tee /etc/sudoers.d/omarchy-tunnels-wg
+   echo "$USER ALL=(root) NOPASSWD: /usr/bin/wg show *" | sudo tee /etc/sudoers.d/omarchy-bananet-wg
    ```
 3. **Root process names** (`tailscaled`, `zerotier-one`, `sshd`…). `ss -p`
    without root does not show other users' processes; the widget guesses them
@@ -128,13 +128,13 @@ privileges* section. The same commands for manual use:
    9993 → zerotier-one, 22 → ssh) and marks them "name guessed from port".
    Full data:
    ```bash
-   echo "$USER ALL=(root) NOPASSWD: /usr/bin/ss" | sudo tee /etc/sudoers.d/omarchy-tunnels-ss
+   echo "$USER ALL=(root) NOPASSWD: /usr/bin/ss" | sudo tee /etc/sudoers.d/omarchy-bananet-ss
    ```
 
 ## Traffic history
 
 The collector stores every interface's byte counters every 30 s in
-`~/.cache/omarchy-tunnels/history.jsonl` and keeps 24 h. It only records while
+`~/.cache/omarchy-bananet/history.jsonl` and keeps 24 h. It only records while
 the bar runs (after suspend/logout the chart shows a gap, not a fake spike).
 Charts show average rates per bucket for the selected range, and the total
 under the chart is the real number of bytes moved in that range. Delete the
@@ -157,16 +157,16 @@ through.
 
 ## Manage
 
-The plugin lives in `~/.config/omarchy/plugins/banan.tunnels/` and reloads on
+The plugin lives in `~/.config/omarchy/plugins/banan.bananet/` and reloads on
 every file save. If a change does not seem to apply, run `omarchy restart shell`.
 
 ```bash
-omarchy plugin enable banan.tunnels
-omarchy plugin disable banan.tunnels      # hide it
-omarchy plugin update banan.tunnels       # pull a new version
-omarchy plugin remove banan.tunnels
-omarchy-shell banan.tunnels toggle        # open/close the panel from a keybinding
-omarchy-shell banan.tunnels refresh
+omarchy plugin enable banan.bananet
+omarchy plugin disable banan.bananet      # hide it
+omarchy plugin update banan.bananet       # pull a new version
+omarchy plugin remove banan.bananet
+omarchy-shell banan.bananet toggle        # open/close the panel from a keybinding
+omarchy-shell banan.bananet refresh
 ```
 
 ## Privacy
