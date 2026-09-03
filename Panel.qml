@@ -39,8 +39,16 @@ Panel {
   // ------------------------------------------------------------------ theme
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
-  readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color dimmer: Qt.darker(foreground, 2.1)
+  // Blend toward the surface the text sits on instead of Qt.darker(): on a
+  // light theme (Catppuccin Latte, Flexoki Light, White) darkening a dark
+  // foreground makes "dim" text *more* prominent, not less.
+  function mix(a, b, t) {
+    return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1)
+  }
+  readonly property color surface: Color.popups.background
+  readonly property color barSurface: Color.bar.background
+  readonly property color dim: mix(foreground, surface, 0.38)
+  readonly property color dimmer: mix(foreground, surface, 0.58)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color hoverFill: Style.hoverFillFor(foreground, Color.accent)
   readonly property color selectedFill: Style.selectedFillFor(foreground, Color.accent)
@@ -86,7 +94,7 @@ Panel {
   readonly property color accentColor: {
     var a = Color.accent
     var f = foreground
-    return (Math.abs(a.r - f.r) + Math.abs(a.g - f.g) + Math.abs(a.b - f.b) < 0.15) ? Qt.darker(f, 1.6) : a
+    return (Math.abs(a.r - f.r) + Math.abs(a.g - f.g) + Math.abs(a.b - f.b) < 0.15) ? mix(f, surface, 0.4) : a
   }
 
   readonly property var egress: snap && snap.egress ? snap.egress : {}
@@ -329,7 +337,7 @@ Panel {
 
   readonly property color barIconColor: {
     var fg = barForeground
-    if (!loaded) return Qt.darker(fg, 1.55)
+    if (!loaded) return mix(fg, barSurface, 0.4)
     if (!defaultIface) return urgent
     return fg
   }
@@ -1418,6 +1426,12 @@ Panel {
     onSeriesChanged: canvas.requestPaint()
     onWidthChanged: canvas.requestPaint()
     onHeightChanged: canvas.requestPaint()
+    // Canvas keeps its last bitmap, so a theme swap must trigger a repaint.
+    Connections {
+      target: root
+      function onForegroundChanged() { canvas.requestPaint() }
+      function onAccentColorChanged() { canvas.requestPaint() }
+    }
 
     function tracePath(ctx, values, x0, w, y0, h, max, closeArea) {
       var n = values.length
