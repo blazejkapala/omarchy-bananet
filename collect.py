@@ -1025,6 +1025,50 @@ TOOLS = (
 )
 
 
+TUNNEL_KINDS = ("tailscale", "zerotier", "wireguard", "openvpn", "vpn")
+# Tailscale's MagicDNS resolver: reachable only over the tailnet, so a resolver
+# on a non-tunnel device is still fine when this is the address being used.
+MAGIC_DNS = ("100.100.100.100", "fd7a:115c:a1e0::53", "fd7a:115c:a1e0:ab12:4843:cd96:6244:144c")
+
+
+def compute_dns_leak(egress_dev, kinds, dns_dev, servers, exit_node):
+    """Do name lookups leave through the same link as the traffic?
+
+    When the default route goes through a tunnel but the resolver sits on the
+    local link, everything still works - and whoever runs that link (the ISP,
+    the cafe router) sees every name looked up, even though the traffic itself
+    is tunnelled. That is worth saying out loud, so this returns what it found
+    and why it is or is not a leak."""
+    egress_kind = kinds.get(egress_dev, "")
+    dns_kind = kinds.get(dns_dev, "")
+    via_tunnel = bool(exit_node) or egress_kind in TUNNEL_KINDS
+    out = {
+        "leaking": False, "viaTunnel": via_tunnel,
+        "egressDev": egress_dev, "egressKind": egress_kind,
+        "dnsDev": dns_dev, "dnsKind": dns_kind, "servers": servers, "detail": "",
+    }
+    if not via_tunnel:
+        out["detail"] = "traffic does not go through a tunnel, so there is nothing to leak out of"
+        return out
+    if any(srv.split("%")[0] in MAGIC_DNS for srv in servers):
+        out["detail"] = "MagicDNS answers over the tailnet"
+        return out
+    if not dns_dev and not servers:
+        out["detail"] = "no resolver found"
+        return out
+    if dns_kind in TUNNEL_KINDS or (dns_dev and dns_dev == egress_dev):
+        out["detail"] = "the resolver is reached over %s, the same link the traffic takes" % (dns_dev or egress_dev)
+        return out
+    out["leaking"] = True
+    where = ", ".join(servers) if servers else "the local resolver"
+    out["detail"] = ("traffic leaves through %s%s but DNS goes to %s%s - whoever runs that link sees every name you look up"
+                     % (egress_dev or "the tunnel",
+                        " (%s)" % egress_kind if egress_kind else "",
+                        where,
+                        " on %s" % dns_dev if dns_dev else ""))
+    return out
+
+
 def collect_tools():
     """What is installed on this machine. The panel adapts to this list: nothing
     is asked of the user for a tool that is simply not there."""
@@ -1411,7 +1455,8 @@ def demo_output(now):
     ]
     return {
         "ts": now, "tookMs": 41, "privilegedSockets": True, "demo": True,
-        "egress": {"v4": {"dst": "1.1.1.1", "dev": "wlp2s0", "gateway": "192.168.1.1", "src": "192.168.1.42", "table": "main"}, "v6": None, "exitNode": None, "dnsDev": "wlp2s0", "dns": ["192.168.1.1"]},
+        "egress": {"v4": {"dst": "1.1.1.1", "dev": "wlp2s0", "gateway": "192.168.1.1", "src": "192.168.1.42", "table": "main"}, "v6": None, "exitNode": None, "dnsDev": "wlp2s0", "dns": ["192.168.1.1"],
+                   "dnsLeak": compute_dns_leak("wlp2s0", {"wlp2s0": "wifi", "tailscale0": "tailscale", "wg0": "wireguard", "ztklhxtbsb": "zerotier"}, "wlp2s0", ["192.168.1.1"], None)},
         "interfaces": interfaces, "tunnelsActive": 3, "connections": connections, "otherStates": 2, "processes": process_list,
         "listeners": listeners, "rules": [], "tailscale": tailscale, "zerotier": {"installed": True, "available": True, "networks": [zt_net], "peers": zt_peers, "rootCount": 4, "rootsDirect": 3},
         "warnings": [], "setup": [], "history": history if OPTS["history"] else None, "historyStep": HISTORY_STEP,
@@ -1684,6 +1729,10 @@ def main():
                    "`ss -p` without root cannot see tailscaled, sshd etc. Optional: click to open a terminal that installs a sudo rule for the two exact read-only `ss` queries the collector runs (asks for your password); right click copies the command.",
                    "", minor=True)
     default_dns_dev = next((d for d, on in dns_default.items() if on and d != "global"), "")
+    default_dns = dns_servers.get(default_dns_dev, []) if default_dns_dev else dns_servers.get("global", [])
+    egress_dev = (egress4 or {}).get("dev", "") or (egress6 or {}).get("dev", "")
+    dns_leak = compute_dns_leak(egress_dev, {i["name"]: i["kind"] for i in interfaces},
+                                default_dns_dev, default_dns, (tailscale or {}).get("exitNode"))
     output = {
         "ts": time.time(),
         "tookMs": int((time.time() - started) * 1000),
@@ -1693,7 +1742,8 @@ def main():
             "v6": egress6,
             "exitNode": (tailscale or {}).get("exitNode"),
             "dnsDev": default_dns_dev,
-            "dns": dns_servers.get(default_dns_dev, []) if default_dns_dev else dns_servers.get("global", []),
+            "dns": default_dns,
+            "dnsLeak": dns_leak,
         },
         "interfaces": interfaces,
         "tunnelsActive": sum(1 for i in interfaces if i["active"] and i["kind"] in ("tailscale", "zerotier", "wireguard", "openvpn", "vpn")),

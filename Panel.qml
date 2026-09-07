@@ -75,6 +75,8 @@ Panel {
   readonly property bool showVirtual: boolSetting("showVirtual", false)
   readonly property bool showLoopback: boolSetting("showLoopback", false)
   readonly property bool publicIp: boolSetting("publicIp", true)
+  readonly property bool notifyEgress: boolSetting("notifyEgressChange", true)
+  readonly property bool exitNodeSwitcher: boolSetting("exitNodeSwitcher", true)
   property bool forcePublic: false     // next refresh re-checks the public IP now (manual refresh)
   readonly property var labelOverrides: {
     var v = setting("labels", null)
@@ -91,6 +93,10 @@ Panel {
   property var rates: ({})
   property var _prev: null
   property string actionStatus: ""
+  property var _egressFrom: null      // last seen egress fingerprint, for change detection
+  property var lastEgressChange: null // { from, to, at } of the most recent change
+  property bool egressAlert: false    // traffic just fell out of a tunnel: bar icon goes urgent
+  property string pendingActionId: "" // an action armed by one click, waiting for the second
   property var history: []            // [[ts, {dev: [rx, tx]}], ...] cumulative counters, 30 s apart, 24 h
   property int chartRange: 3600       // seconds shown in charts: 3600 / 21600 / 86400
   readonly property color accentColor: {
@@ -102,6 +108,8 @@ Panel {
   readonly property var egress: snap && snap.egress ? snap.egress : {}
   readonly property var egress4: egress.v4 || null
   readonly property var pub: snap && snap.public ? snap.public : null
+  readonly property var dnsLeak: egress.dnsLeak || null
+  readonly property bool dnsLeaking: !!(dnsLeak && dnsLeak.leaking)
   readonly property var tools: snap && snap.tools ? snap.tools : []
   readonly property string publicText: {
     if (!pub) return ""
@@ -185,8 +193,46 @@ Panel {
     lastSampleMs = Date.now()
     lastError = doc.error ? String(doc.error) : ""
     if (doc.history && doc.history.length !== undefined) history = doc.history
+    noteEgressChange(doc)
     syncRows()
     if (_restoringScroll) Qt.callLater(restoreScroll)
+  }
+
+  // Which link does the internet leave through right now? Compared between
+  // samples so a tunnel dropping out is noticed the moment it happens, not
+  // whenever the user next opens the panel.
+  function egressFingerprint(doc) {
+    var e = (doc && doc.egress) || {}
+    var dev = (e.v4 && e.v4.dev) || (e.v6 && e.v6.dev) || ""
+    var kind = ""
+    var list = (doc && doc.interfaces) || []
+    for (var i = 0; i < list.length; i++) if (list[i].name === dev) { kind = list[i].kind; break }
+    var exitNode = e.exitNode ? (e.exitNode.name || (e.exitNode.ips || []).join(",")) : ""
+    return { key: dev + "|" + kind + "|" + exitNode, dev: dev, kind: kind, exitNode: exitNode }
+  }
+
+  function egressLabelOf(f) {
+    if (!f || !f.dev) return "no route"
+    return f.dev + (f.kind ? " (" + f.kind + ")" : "") + (f.exitNode ? " via exit node " + f.exitNode : "")
+  }
+
+  function tunnelled(f) { return !!f && (isTunnelKind(f.kind) || !!f.exitNode) }
+
+  function noteEgressChange(doc) {
+    var now = egressFingerprint(doc)
+    if (!_egressFrom) { _egressFrom = now; return }   // first sample: nothing to compare with
+    if (now.key === _egressFrom.key) return
+    var prev = _egressFrom
+    _egressFrom = now
+    lastEgressChange = { from: prev, to: now, at: Date.now() / 1000 }
+    var lost = tunnelled(prev) && !tunnelled(now)
+    if (lost) { egressAlert = true; egressAlertTimer.restart() }
+    if (notifyEgress) {
+      Quickshell.execDetached(["notify-send", "-a", "Bananet",
+                              "-u", lost ? "critical" : "normal",
+                              lost ? "Bananet: traffic left the tunnel" : "Bananet: egress changed",
+                              egressLabelOf(prev) + "  →  " + egressLabelOf(now)])
+    }
   }
 
   function handleOutput(text) {
@@ -275,6 +321,26 @@ Panel {
     onTriggered: root.refresh()
   }
 
+  // The bar icon stays urgent for two minutes after traffic falls out of a
+  // tunnel, or until the panel is opened - long enough to be noticed, short
+  // enough not to nag.
+  Timer {
+    id: egressAlertTimer
+    interval: 120000
+    repeat: false
+    onTriggered: root.egressAlert = false
+  }
+
+  Timer {
+    id: pendingActionTimer
+    interval: 6000
+    repeat: false
+    onTriggered: {
+      root.pendingActionId = ""
+      if (root.actionStatus.indexOf("Click again") === 0) root.actionStatus = ""
+    }
+  }
+
   Timer {
     id: actionStatusTimer
     interval: 2200
@@ -287,7 +353,7 @@ Panel {
   Timer { interval: 1000; repeat: true; running: root.opened; onTriggered: root.clockTick += 1 }
 
   onOpenedChanged: {
-    if (opened) { cursorActive = false; refresh() }
+    if (opened) { cursorActive = false; egressAlert = false; refresh() }
   }
 
 
@@ -387,7 +453,7 @@ Panel {
   readonly property color barIconColor: {
     var fg = barForeground
     if (!loaded) return mix(fg, barSurface, 0.4)
-    if (!defaultIface) return urgent
+    if (!defaultIface || egressAlert) return urgent
     return fg
   }
   readonly property string barTooltip: {
@@ -600,6 +666,49 @@ Panel {
     else if (row.section === "proc" && row.item.remotes.length > 0) copyText(row.item.remotes[0].addr, row.item.name + " address")
     else if (row.section === "listen") copyText(row.item.addr + ":" + row.item.port, "address")
   }
+  // Two-step by design: the first click arms the action and shows the exact
+  // command, the second runs it. Nothing here needs root; if tailscaled refuses,
+  // the status line says which one-time `tailscale set --operator` fixes it.
+  function runAction(item) {
+    if (!item || !item.cmd || !exitNodeSwitcher) return
+    if (pendingActionId !== item.id) {
+      pendingActionId = item.id
+      pendingActionTimer.restart()
+      actionStatus = "Click again to run: " + item.cmd.join(" ")
+      actionStatusTimer.stop()
+      return
+    }
+    pendingActionId = ""
+    pendingActionTimer.stop()
+    if (actionRunner.running) return
+    actionRunner.label = item.t
+    actionRunner.command = item.cmd
+    actionRunner.running = true
+    actionStatus = "Running " + item.cmd.join(" ") + "…"
+    actionStatusTimer.stop()
+  }
+
+  Process {
+    id: actionRunner
+    property string label: ""
+    running: false
+    command: []
+    stdout: StdioCollector { id: actionOut; waitForEnd: true }
+    stderr: StdioCollector { id: actionErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var err = String(actionErr.text || "").trim()
+      if (exitCode === 0) {
+        root.actionStatus = "Done: " + actionRunner.label
+        root.refresh()
+      } else if (/operator|access denied|permission denied|not permitted/i.test(err)) {
+        root.actionStatus = "tailscaled refused: run `sudo tailscale set --operator=$USER` once, then try again"
+      } else {
+        root.actionStatus = "Failed: " + (err.split("\n").slice(-1)[0] || ("exit code " + exitCode))
+      }
+      actionStatusTimer.restart()
+    }
+  }
+
   function copyText(value, label) {
     var text = String(value || "")
     if (text === "") return
@@ -791,6 +900,20 @@ Panel {
       if (t.tailnet) lines.push({ t: "Tailnet: " + t.tailnet + (t.magicDns ? " · MagicDNS " + t.magicDns : ""), k: "item" })
       lines.push({ t: "Exit node: " + (t.exitNode ? (t.exitNode.name || t.exitNode.ips.join(",")) + (t.exitNode.online ? " (online)" : " (offline!)") : "none — internet leaves locally"), k: "item" })
       var peers = t.peers || []
+      // The only place the widget changes the system instead of describing it,
+      // so every action takes two clicks and says exactly what it will run.
+      if (exitNodeSwitcher) {
+        if (t.exitNode) {
+          lines.push({ t: "Stop using " + (t.exitNode.name || "the exit node") + " — internet goes back out locally",
+                       k: "action", id: "exit:off", cmd: ["tailscale", "set", "--exit-node="] })
+        }
+        for (var xp = 0; xp < peers.length; xp++) {
+          var xe = peers[xp]
+          if (!xe.exitNodeOption || xe.exitNode || !xe.online || !xe.ip) continue
+          lines.push({ t: "Route all internet traffic through " + xe.name,
+                       k: "action", id: "exit:" + xe.ip, cmd: ["tailscale", "set", "--exit-node=" + xe.ip] })
+        }
+      }
       if (peers.length) lines.push({ t: "Peers (" + peers.length + "):", k: "head" })
       for (var p = 0; p < peers.length; p++) {
         var pe = peers[p]
@@ -1007,7 +1130,30 @@ Panel {
             InfoLine { label: "IPv4"; value: root.egress4 ? (root.egress4.dev + (root.egress4.gateway ? " → " + root.egress4.gateway : " (no gateway)") + (root.egress4.src ? "  from " + root.egress4.src : "") + (root.egress4.table && root.egress4.table !== "main" ? "  [table " + root.egress4.table + "]" : "")) : (root.loaded ? "no route" : "…") }
             InfoLine { label: "IPv6"; value: root.egress6 ? (root.egress6.dev + (root.egress6.gateway ? " → " + root.egress6.gateway : "") + (root.egress6.src ? "  from " + root.egress6.src : "")) : "no route (IPv4 only)"; dimValue: !root.egress6 }
             InfoLine { visible: !!root.egress.exitNode; label: "Exit"; value: root.egress.exitNode ? ("Tailscale exit node " + (root.egress.exitNode.name || (root.egress.exitNode.ips || []).join(",")) + (root.egress.exitNode.online ? "" : " — OFFLINE")) : ""; urgentValue: root.egress.exitNode ? !root.egress.exitNode.online : false }
-            InfoLine { label: "DNS"; value: root.egress.dns && root.egress.dns.length ? root.egress.dns.join(", ") + (root.egress.dnsDev ? "  via " + root.egress.dnsDev : "") : (root.loaded ? "none" : "…") }
+            InfoLine {
+              label: "DNS"
+              value: root.egress.dns && root.egress.dns.length ? root.egress.dns.join(", ") + (root.egress.dnsDev ? "  via " + root.egress.dnsDev : "") : (root.loaded ? "none" : "…")
+              urgentValue: root.dnsLeaking
+            }
+            Text {
+              visible: root.dnsLeaking
+              width: parent.width
+              leftPadding: Style.space(52)
+              text: "⚠ DNS leaves the tunnel: " + (root.dnsLeak ? root.dnsLeak.detail : "")
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            InfoLine {
+              visible: !!root.lastEgressChange
+              label: "Changed"
+              value: root.lastEgressChange
+                     ? (root.fmtAge(Math.max(0, Math.round(Date.now() / 1000 - root.lastEgressChange.at + 0 * root.clockTick))) + " ago:  "
+                        + root.egressLabelOf(root.lastEgressChange.from) + "  →  " + root.egressLabelOf(root.lastEgressChange.to))
+                     : ""
+              urgentValue: root.egressAlert
+            }
             InfoLine { visible: root.publicIp; label: "Public"; value: root.pub ? root.publicText : (root.loaded ? "checking…" : "…"); dimValue: !root.pub || !root.pub.available || !!root.pub.stale; urgentValue: !!(root.pub && root.pub.available === false && root.pub.error) }
 
             Repeater {
@@ -1312,18 +1458,63 @@ Panel {
 
     Repeater {
       model: lines
-      delegate: Text {
-        textFormat: Text.PlainText
+      delegate: Item {
+        id: detailLine
         required property var modelData
+        readonly property bool isAction: modelData.k === "action"
+        readonly property bool armed: isAction && root.pendingActionId === modelData.id
         width: parent.width
-        leftPadding: modelData.k === "item" ? Style.space(14) : 0
-        topPadding: modelData.k === "head" ? Style.space(4) : 0
-        text: modelData.t
-        color: modelData.k === "warn" ? root.urgent : (modelData.k === "head" ? root.foreground : (modelData.dim ? root.dimmer : root.dim))
-        font.family: root.fontFamily
-        font.pixelSize: modelData.k === "head" ? Style.font.bodySmall : Style.font.caption
-        font.bold: modelData.k === "head"
-        wrapMode: Text.WrapAnywhere
+        implicitHeight: lineText.implicitHeight + (isAction ? Style.space(8) : 0)
+
+        Rectangle {
+          visible: detailLine.isAction
+          anchors.fill: parent
+          anchors.leftMargin: Style.space(14)
+          anchors.topMargin: Style.space(2)
+          anchors.bottomMargin: Style.space(2)
+          radius: Style.cornerRadius
+          color: detailLine.armed ? Util.alpha(root.accentColor, 0.12)
+                                  : (actionMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accentColor) : "transparent")
+          border.width: 1
+          border.color: root.mix(root.accentColor, root.surface, detailLine.armed ? 0.0 : (actionMouse.containsMouse ? 0.3 : 0.65))
+        }
+
+        Text {
+          id: lineText
+          textFormat: Text.PlainText
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          leftPadding: (modelData.k === "item" || detailLine.isAction) ? Style.space(detailLine.isAction ? 22 : 14) : 0
+          rightPadding: detailLine.isAction ? Style.space(8) : 0
+          topPadding: modelData.k === "head" ? Style.space(4) : 0
+          text: detailLine.isAction
+                ? ("󰑓  " + modelData.t + (detailLine.armed ? "   — click again to confirm" : ""))
+                : modelData.t
+          color: modelData.k === "warn" ? root.urgent
+               : detailLine.isAction ? (detailLine.armed ? root.urgent : root.accentColor)
+               : (modelData.k === "head" ? root.foreground : (modelData.dim ? root.dimmer : root.dim))
+          font.family: root.fontFamily
+          font.pixelSize: modelData.k === "head" ? Style.font.bodySmall : Style.font.caption
+          font.bold: modelData.k === "head" || detailLine.armed
+          wrapMode: Text.WrapAnywhere
+        }
+
+        MouseArea {
+          id: actionMouse
+          anchors.fill: parent
+          enabled: detailLine.isAction
+          visible: detailLine.isAction
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.runAction(detailLine.modelData)
+
+          PanelToolTip {
+            visible: actionMouse.containsMouse
+            text: root.plain("Runs: " + (detailLine.modelData.cmd || []).join(" ") + "\nTakes two clicks; nothing else on this machine changes.")
+            fontFamily: root.fontFamily
+          }
+        }
       }
     }
   }

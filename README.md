@@ -53,7 +53,9 @@ Colours follow the active Omarchy theme, light or dark:
   resolver, **public IP** (IPv4 / IPv6) with the owning network, city and
   country, warnings. The public address is checked every 5 minutes, when the
   egress route changes, and on manual refresh (`r`); a failed check keeps the
-  last answer marked *stale* instead of pretending.
+  last answer marked *stale* instead of pretending. Two warnings live here:
+  **DNS leaving the tunnel** and **the egress link having just changed** (see
+  *Watching for trouble*).
 - *Interfaces & tunnels* — one row per interface: kind, network/tailnet name,
   IP, gateway, Wi‑Fi signal, connection count, a sparkline and live ↓/↑ rates.
   Hover = tooltip with details; click/Enter = expand: **traffic chart over
@@ -102,6 +104,8 @@ Colours follow the active Omarchy theme, light or dark:
 | `showLabel` | false | `wifi +2` label next to the icon |
 | `showTooltip` | false | summary tooltip on hover |
 | `publicIp` | true | check the public IP and its owner (icanhazip.com + ipinfo.io), see *Privacy* |
+| `notifyEgressChange` | true | desktop notification when the internet starts leaving through a different link |
+| `exitNodeSwitcher` | true | offer Tailscale exit-node switching in the panel (two clicks, runs `tailscale set`) |
 | `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-bananet/`) |
 | `useSudo` | true | try `sudo -n` for the five allowlisted read-only commands (`zerotier-cli -j listnetworks`/`listpeers`, `wg show all dump`, `ss -tunpHO`, `ss -tulnpHO`); passwordless only, answer remembered 10 min |
 | `showInactive` | true | list interfaces that are down (e.g. Ethernet without a cable) |
@@ -189,6 +193,36 @@ lock `sudo` out. Prefer to do it yourself? Run `sudo visudo -f
    with `sudo rm -f /etc/sudoers.d/omarchy-tunnels-ss`.
 
 To undo any of them: `sudo rm -f /etc/sudoers.d/omarchy-bananet-NAME`.
+
+## Watching for trouble
+
+Two things the widget will tell you about without being asked:
+
+**The tunnel dropped.** Every refresh the collector reports which link the
+internet actually leaves through. When that changes, the panel gets a
+*Changed* line ("2 min ago: wg0 (wireguard) → wlp2s0 (wifi)") and a desktop
+notification goes out; falling *out* of a tunnel is sent as urgent and turns
+the bar icon red for two minutes or until you open the panel. Set
+`notifyEgressChange` to `false` for the panel line without the notification.
+
+**DNS is leaking out of the tunnel.** Traffic can go through WireGuard or a
+Tailscale exit node while name lookups still go to the router on the local
+link — everything works, and whoever runs that link sees every name you look
+up. When the default route is a tunnel but the resolver is not on it, the DNS
+line turns red and says exactly which resolver on which interface is answering.
+MagicDNS (`100.100.100.100`) counts as being on the tunnel, so a normal
+Tailscale setup does not cry wolf.
+
+## Switching the Tailscale exit node
+
+The Tailscale section lists every peer that offers itself as an exit node.
+Clicking one arms the action and shows the exact command; clicking again runs
+`tailscale set --exit-node=<ip>`. With an exit node active there is also
+*Stop using …*, which runs `tailscale set --exit-node=`. This is the only
+place where the widget changes the machine instead of describing it, so it
+always takes two clicks, always shows the command first, and never uses root.
+If tailscaled refuses, run `sudo tailscale set --operator=$USER` once. Set
+`exitNodeSwitcher` to `false` to remove these actions entirely.
 
 ## Traffic history
 
