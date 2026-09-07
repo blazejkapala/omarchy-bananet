@@ -220,10 +220,14 @@ Panel {
 
   function noteEgressChange(doc) {
     var now = egressFingerprint(doc)
+    now.demo = !!doc.demo
     if (!_egressFrom) { _egressFrom = now; return }   // first sample: nothing to compare with
     if (now.key === _egressFrom.key) return
     var prev = _egressFrom
     _egressFrom = now
+    // Demo mode invents its own network. Switching into or out of it is not
+    // something that happened to this machine, so it never alerts.
+    if (prev.demo || now.demo) { lastEgressChange = null; return }
     lastEgressChange = { from: prev, to: now, at: Date.now() / 1000 }
     var lost = tunnelled(prev) && !tunnelled(now)
     if (lost) { egressAlert = true; egressAlertTimer.restart() }
