@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "banan.bananet",
   "name": "Bananet",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "banan",
   "license": "MIT",
   "description": "Bananet — where does your traffic go? Networks, tunnels, egress route and per-service connections in the Omarchy bar: Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN, public IP and its owner, live throughput with 24 h charts, routes, DNS, and which services talk to which addresses over which link.",

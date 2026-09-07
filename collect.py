@@ -11,9 +11,14 @@ Prints one JSON document describing:
 
 Runs without root. Some detail needs extra privileges and degrades gracefully:
   * `ss -p` only shows process names for your own processes; root daemons are guessed by port
-  * `wg show` and `zerotier-cli` need root (or a passwordless sudo rule / user auth token)
-The collector tries `sudo -n` for those once and remembers the answer for 10 minutes.
+  * `wg show` and `zerotier-cli` answer fully only to root
+The collector tries `sudo -n` once for each and remembers the answer for 10 minutes.
+It never runs anything under sudo beyond the read-only commands in SUDO_ALLOWED,
+and never copies a daemon's credentials anywhere; the optional sudoers rules the
+README documents name exactly those commands with exactly those arguments.
 """
+import http.client
+import ipaddress
 import json
 import os
 import re
@@ -22,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -65,6 +71,31 @@ WELL_KNOWN_PORTS = {
 LOOPBACK_RE = re.compile(r"^(127\.|::1$|0\.0\.0\.0$|::$)")
 WARNINGS = []
 SETUP = []
+
+# Every command the collector may run through sudo, in full. sudo_run refuses
+# anything else, so the sudoers rules the setup cards offer can name these exact
+# argument vectors: read-only queries, no wildcards, no root command surface
+# beyond what is listed here.
+SUDO_ALLOWED = (
+    ("zerotier-cli", "-j", "listnetworks"),
+    ("zerotier-cli", "-j", "listpeers"),
+    ("wg", "show", "all", "dump"),
+    ("ss", "-tunpHO"),
+    ("ss", "-tulnpHO"),
+)
+
+
+def sudoers_command(name, specs):
+    """Shell one-liner installing an exact-command sudoers rule. visudo checks the
+    file before it is put in place, so a typo can never lock sudo out."""
+    rule = "$USER ALL=(root) NOPASSWD: " + ", ".join(specs)
+    return ("f=$(mktemp) && printf '%%s\\n' \"%s\" > \"$f\" && sudo visudo -cqf \"$f\" "
+            "&& sudo install -m 440 -o root -g root \"$f\" /etc/sudoers.d/omarchy-bananet-%s "
+            "&& rm -f \"$f\" && echo OK") % (rule, name)
+
+
+def tool_path(name):
+    return which(name) or "/usr/bin/" + name
 
 
 # --------------------------------------------------------------------------- helpers
@@ -122,6 +153,8 @@ def sudo_run(cmd, key, timeout=2.5):
     global _sudo_state
     if not OPTS["sudo"]:
         return -1, "", "sudo disabled"
+    if tuple(cmd) not in SUDO_ALLOWED:
+        return -1, "", "not an allowed sudo command"
     if _sudo_state is None:
         _sudo_state = load_json_file(SUDO_CACHE, {})
     now = time.time()
@@ -463,12 +496,13 @@ def collect_zerotier():
     if not out:
         hint = ""
         if "authtoken" in err.lower() or "as root" in err.lower():
-            hint = "zerotier-cli needs the auth token. Copy it once into your home directory (below) and networks, peers and latency will show up here."
+            zt = tool_path("zerotier-cli")
+            hint = "zerotier-cli needs root (or the daemon's auth token) to answer. Allow the two read-only queries below and networks, peers and latency will show up here."
             SETUP.append({
                 "id": "zerotier",
                 "title": "ZeroTier needs a one-time setup",
-                "detail": "Without the token only the interface and routes are visible. Click to open a terminal with the command (sudo will ask for your password); right click copies it.",
-                "command": "sudo cp /var/lib/zerotier-one/authtoken.secret ~/.zeroTierOneAuthToken && sudo chown \"$USER\" ~/.zeroTierOneAuthToken && chmod 600 ~/.zeroTierOneAuthToken",
+                "detail": "Without it only the interface and routes are visible. Click to open a terminal with the command (sudo will ask for your password); right click copies it. It allows exactly two read-only queries, nothing else.",
+                "command": sudoers_command("zerotier", ["%s -j listnetworks" % zt, "%s -j listpeers" % zt]),
                 "iface": "zerotier",
             })
         else:
@@ -531,8 +565,8 @@ def collect_wireguard(links, active_conns):
             SETUP.append({
                 "id": "wireguard",
                 "title": "WireGuard: no access to `wg show`",
-                "detail": "Peers, endpoints and handshakes need root. Click to add a passwordless sudo rule for `wg show` only (asks for your password); right click copies the command.",
-                "command": "echo \"$USER ALL=(root) NOPASSWD: /usr/bin/wg show *\" | sudo tee /etc/sudoers.d/omarchy-bananet-wg >/dev/null && echo OK",
+                "detail": "Peers, endpoints and handshakes need root. Click to add a passwordless sudo rule for the single command `wg show all dump` (asks for your password); right click copies it.",
+                "command": sudoers_command("wg", ["%s show all dump" % tool_path("wg")]),
                 "iface": "wireguard",
             })
     elif devs:
@@ -609,10 +643,68 @@ def collect_tools():
     return out
 
 
-def http_get(url, timeout):
+# The only hosts the collector ever talks to, and only over HTTPS on port 443.
+PUBLIC_HOSTS = ("ipv4.icanhazip.com", "ipv6.icanhazip.com", "ipinfo.io")
+HTTP_MAX_BYTES = 64 * 1024
+
+
+def is_public_addr(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_multicast or addr.is_reserved or addr.is_unspecified)
+
+
+class PublicOnlyHTTPSConnection(http.client.HTTPSConnection):
+    """Drop a connection that landed on a loopback, private or link-local address."""
+
+    def connect(self):
+        http.client.HTTPSConnection.connect(self)
+        try:
+            peer = self.sock.getpeername()[0].split("%")[0]
+        except OSError:
+            peer = ""
+        if not is_public_addr(peer):
+            self.close()
+            raise OSError("%s resolved to non-public address %s" % (self.host, peer or "?"))
+
+
+class PublicOnlyHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PublicOnlyHTTPSConnection, req, context=self._context)
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Returning None makes urllib raise instead of following the redirect, so a
+    redirect can never move the request off the allowlisted host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_public_opener = None
+
+
+def http_get(url, timeout, max_bytes=HTTP_MAX_BYTES):
+    """Fetch one of the fixed public endpoints: HTTPS only, allowlisted host and
+    port, no redirects, connection must land on a public address, body read
+    through a hard byte cap before it is decoded."""
+    global _public_opener
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in PUBLIC_HOSTS or parts.port not in (None, 443):
+        raise ValueError("blocked URL: %s" % url)
+    if _public_opener is None:
+        _public_opener = urllib.request.build_opener(NoRedirectHandler, PublicOnlyHTTPSHandler())
     req = urllib.request.Request(url, headers={"User-Agent": "omarchy-bananet/1.0", "Accept": "application/json, text/plain"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace").strip()
+    with _public_opener.open(req, timeout=timeout) as r:
+        if r.status != 200:
+            raise OSError("HTTP %s from %s" % (r.status, parts.hostname))
+        data = r.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise OSError("response from %s exceeds %d bytes" % (parts.hostname, max_bytes))
+    return data.decode("utf-8", "replace").strip()
 
 
 def collect_public(egress4, egress6, exit_node):
@@ -669,7 +761,7 @@ def collect_public(egress4, egress6, exit_node):
     if geo is None:
         geo = {}
         try:
-            data = json.loads(http_get("https://ipinfo.io/%s/json" % geo_ip, 3.0))
+            data = json.loads(http_get("https://ipinfo.io/%s/json" % ipaddress.ip_address(geo_ip), 3.0))
             geo = {k: data.get(k, "") for k in ("hostname", "city", "region", "country", "org", "timezone")}
         except Exception as e:  # noqa: BLE001
             geo = {"error": str(e).split("\n")[0][:120]}
@@ -1197,8 +1289,8 @@ def main():
         SETUP.append({
             "id": "ss",
             "title": "Root process names are guessed",
-            "detail": "`ss -p` without root cannot see tailscaled, sshd etc. Optional: click to allow passwordless `sudo ss` (asks for your password); right click copies the command.",
-            "command": "echo \"$USER ALL=(root) NOPASSWD: /usr/bin/ss\" | sudo tee /etc/sudoers.d/omarchy-bananet-ss >/dev/null && echo OK",
+            "detail": "`ss -p` without root cannot see tailscaled, sshd etc. Optional: click to allow the two exact read-only `ss` queries the collector runs (asks for your password); right click copies the command.",
+            "command": sudoers_command("ss", ["%s -tunpHO" % tool_path("ss"), "%s -tulnpHO" % tool_path("ss")]),
             "iface": "",
             "minor": True,
         })

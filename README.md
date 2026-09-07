@@ -102,7 +102,7 @@ Colours follow the active Omarchy theme, light or dark:
 | `showTooltip` | false | summary tooltip on hover |
 | `publicIp` | true | check the public IP and its owner (icanhazip.com + ipinfo.io), see *Privacy* |
 | `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-bananet/`) |
-| `useSudo` | true | try `sudo -n` for `wg`, `zerotier-cli`, `ss` (passwordless only; answer remembered 10 min) |
+| `useSudo` | true | try `sudo -n` for the five allowlisted read-only commands (`zerotier-cli -j listnetworks`/`listpeers`, `wg show all dump`, `ss -tunpHO`, `ss -tulnpHO`); passwordless only, answer remembered 10 min |
 | `showInactive` | true | list interfaces that are down (e.g. Ethernet without a cable) |
 | `showVirtual` | false | list bridges/veth (Docker etc.) |
 | `showLoopback` | false | count connections to localhost |
@@ -126,26 +126,45 @@ runs it (sudo asks for the password there), right click copies it. Less
 important ones (`ss` for root process names) live in the *Optional
 privileges* section. The same commands for manual use:
 
-1. **ZeroTier** (`zerotier-cli` wants its auth token):
+Each one is a sudoers rule naming the **exact command with its exact
+arguments** — every command below is read-only, and the collector refuses to
+run anything else through `sudo` (the allowlist is `SUDO_ALLOWED` at the top of
+`collect.py`). No auth token or secret is ever copied out of `/var/lib`, and no
+rule uses a wildcard. Each command writes the rule to a temporary file,
+validates it with `visudo -c` and only then installs it, so a typo cannot lock
+`sudo` out.
+
+1. **ZeroTier networks and peers** (`zerotier-cli` answers only to the daemon's
+   auth token, which is root-owned). Allow the two read-only queries the
+   collector runs:
    ```bash
-   sudo cp /var/lib/zerotier-one/authtoken.secret ~/.zeroTierOneAuthToken
-   sudo chown $USER ~/.zeroTierOneAuthToken && chmod 600 ~/.zeroTierOneAuthToken
+   f=$(mktemp) && printf '%s\n' "$USER ALL=(root) NOPASSWD: /usr/bin/zerotier-cli -j listnetworks, /usr/bin/zerotier-cli -j listpeers" > "$f" \
+     && sudo visudo -cqf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/omarchy-bananet-zerotier && rm -f "$f"
    ```
+   Earlier versions suggested copying `/var/lib/zerotier-one/authtoken.secret`
+   into your home directory. Do not do that — that token controls the daemon,
+   not just the read-only views this widget needs. If you followed the old
+   README, remove the copy: `rm -f ~/.zeroTierOneAuthToken`.
 2. **WireGuard peers and handshakes** (`wg show` needs CAP_NET_ADMIN). Without
    it the widget still shows the interface, addresses, routes and counters, and
    takes peers from NetworkManager if the tunnel is configured there. For full
-   data:
+   data, allow the single command the collector runs:
    ```bash
-   echo "$USER ALL=(root) NOPASSWD: /usr/bin/wg show *" | sudo tee /etc/sudoers.d/omarchy-bananet-wg
+   f=$(mktemp) && printf '%s\n' "$USER ALL=(root) NOPASSWD: /usr/bin/wg show all dump" > "$f" \
+     && sudo visudo -cqf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/omarchy-bananet-wg && rm -f "$f"
    ```
 3. **Root process names** (`tailscaled`, `zerotier-one`, `sshd`…). `ss -p`
    without root does not show other users' processes; the widget guesses them
    from ports and remote names (41641 / derp*.tailscale.com → tailscaled,
    9993 → zerotier-one, 22 → ssh) and marks them "name guessed from port".
-   Full data:
+   Full data, allowing exactly the two queries the collector runs — and nothing
+   else, so `ss -K` (which can destroy sockets) stays behind a password:
    ```bash
-   echo "$USER ALL=(root) NOPASSWD: /usr/bin/ss" | sudo tee /etc/sudoers.d/omarchy-bananet-ss
+   f=$(mktemp) && printf '%s\n' "$USER ALL=(root) NOPASSWD: /usr/bin/ss -tunpHO, /usr/bin/ss -tulnpHO" > "$f" \
+     && sudo visudo -cqf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/omarchy-bananet-ss && rm -f "$f"
    ```
+   If you installed the earlier, unrestricted rule, replace it:
+   `sudo rm -f /etc/sudoers.d/omarchy-bananet-ss` and run the command above.
 
 ## Traffic history
 
@@ -194,7 +213,10 @@ Everything runs locally except two optional lookups:
   tells who owns it (organisation, city, country). This happens at most every
   5 minutes, when the egress route changes, or on manual refresh, never on every
   tick; the answer is cached in `~/.cache/omarchy-bananet/public.json`. Set
-  `publicIp` to `false` to never contact these services.
+  `publicIp` to `false` to never contact these services. Those three hosts are
+  the only ones the collector can reach: HTTPS on port 443 only, redirects are
+  refused, a connection that lands on a loopback, private or link-local address
+  is dropped, and the body is read through a 64 KB cap before it is parsed.
 - **Reverse DNS** for remote addresses (`resolveNames`), which goes through
   your normal resolver.
 
