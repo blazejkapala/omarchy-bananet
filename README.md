@@ -22,6 +22,7 @@ omarchy bar move banan.bananet --before omarchy.tailscale   # optional placement
 
 Requirements: Omarchy 4.x (Quickshell bar), `python3`, `iproute2`, `nmcli`,
 `resolvectl`, `ss`. Optional: `tailscale`, `zerotier-cli`, `wg`, `wl-copy`.
+All of them are used at their fixed paths under `/usr/bin`.
 Set `demo` to `true` in the widget settings to see it with synthetic data.
 
 ## What you see
@@ -114,32 +115,50 @@ Example: `omarchy bar set banan.bananet labels '{"wg0":"MikroTik BTH"}' --json`
 ## Privileges — what works without root and what needs one step
 
 The collector first detects what is installed (`tailscale`, `zerotier-cli`,
-`wg`, `openvpn`, `nmcli`, `resolvectl`, `ss`) and only uses those tools; the
-panel footer lists what it found. Nothing is suggested for a tool that is not
-there, so a machine without WireGuard never sees a WireGuard setup card.
+`wg`, `openvpn`, `nmcli`, `resolvectl`, `ss`, all at their fixed paths under
+`/usr/bin`; nothing is looked up through `PATH`) and only uses those tools;
+the panel footer lists what it found. Nothing is suggested for a tool that is
+not there, so a machine without WireGuard never sees a WireGuard setup card.
 
 Everything basic (interfaces, routes, counters, DNS, Tailscale, connections
-of your own processes) works without root. Three things need a one-time setup.
-**The panel shows them itself**: a red card appears under the interface it
-concerns (e.g. ZeroTier) with the command. Left click opens a terminal and
-runs it (sudo asks for the password there), right click copies it. Less
-important ones (`ss` for root process names) live in the *Optional
-privileges* section. The same commands for manual use:
+of your own processes) works without root. Three things need a one-time
+sudoers rule. **The panel shows them itself**: a red card appears under the
+interface it concerns (e.g. ZeroTier) with the exact rule it would install.
+Left click opens a terminal that installs it (sudo asks for the password
+there), right click copies the command. Less important ones (`ss` for root
+process names) live in the *Optional privileges* section.
 
-Each one is a sudoers rule naming the **exact command with its exact
-arguments** — every command below is read-only, and the collector refuses to
-run anything else through `sudo` (the allowlist is `SUDO_ALLOWED` at the top of
-`collect.py`). No auth token or secret is ever copied out of `/var/lib`, and no
-rule uses a wildcard. Each command writes the rule to a temporary file,
-validates it with `visudo -c` and only then installs it, so a typo cannot lock
-`sudo` out.
+Each rule names the **exact commands with their exact arguments** — every
+command is read-only, and the collector refuses to run anything else through
+`sudo` (the allowlist is `SUDO_ALLOWED` at the top of `collect.py`). No auth
+token or secret is ever copied out of `/var/lib`, and no rule uses a wildcard.
+The subject is your numeric UID, and `NOSETENV` / `env_reset` /
+`secure_path` keep your environment out of the root command.
+
+How a rule gets installed (`collect.py --setup NAME`, what the card runs):
+
+```
+/usr/bin/python3 -I ~/.config/omarchy/plugins/banan.bananet/collect.py --setup zerotier
+```
+
+The command prints the rule, then runs `sudo /usr/bin/python3 -I -` with a
+small self-contained installer on stdin. That root-side program generates the
+rule bytes itself from a fixed table (it accepts nothing from the caller but
+the rule name and the `SUDO_UID` sudo sets), checks that every target binary
+is a root-owned read-only file under `/usr/bin`, writes the rule into a
+private root-owned staging directory inside `/etc/sudoers.d`, validates it
+with `visudo -c` and publishes it with a single atomic rename. Root never
+opens a file from the plugin directory or from `/tmp`, and a typo can never
+lock `sudo` out. Prefer to do it yourself? Run `sudo visudo -f
+/etc/sudoers.d/omarchy-bananet-NAME` and paste the rule the card shows.
 
 1. **ZeroTier networks and peers** (`zerotier-cli` answers only to the daemon's
-   auth token, which is root-owned). Allow the two read-only queries the
-   collector runs:
-   ```bash
-   f=$(mktemp) && printf '%s\n' "$USER ALL=(root) NOPASSWD: /usr/bin/zerotier-cli -j listnetworks, /usr/bin/zerotier-cli -j listpeers" > "$f" \
-     && sudo visudo -cqf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/omarchy-bananet-zerotier && rm -f "$f"
+   auth token, which is root-owned). `--setup zerotier` allows the two
+   read-only queries the collector runs:
+   ```
+   Cmnd_Alias BANANET_ZEROTIER = /usr/bin/zerotier-cli -j listnetworks, /usr/bin/zerotier-cli -j listpeers
+   Defaults!BANANET_ZEROTIER env_reset, !setenv, secure_path="/usr/bin:/bin"
+   #1000 ALL=(root) NOPASSWD: NOSETENV: BANANET_ZEROTIER
    ```
    Earlier versions suggested copying `/var/lib/zerotier-one/authtoken.secret`
    into your home directory. Do not do that — that token controls the daemon,
@@ -148,23 +167,28 @@ validates it with `visudo -c` and only then installs it, so a typo cannot lock
 2. **WireGuard peers and handshakes** (`wg show` needs CAP_NET_ADMIN). Without
    it the widget still shows the interface, addresses, routes and counters, and
    takes peers from NetworkManager if the tunnel is configured there. For full
-   data, allow the single command the collector runs:
-   ```bash
-   f=$(mktemp) && printf '%s\n' "$USER ALL=(root) NOPASSWD: /usr/bin/wg show all dump" > "$f" \
-     && sudo visudo -cqf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/omarchy-bananet-wg && rm -f "$f"
+   data, `--setup wg` allows the single command the collector runs:
+   ```
+   Cmnd_Alias BANANET_WG = /usr/bin/wg show all dump
+   Defaults!BANANET_WG env_reset, !setenv, secure_path="/usr/bin:/bin"
+   #1000 ALL=(root) NOPASSWD: NOSETENV: BANANET_WG
    ```
 3. **Root process names** (`tailscaled`, `zerotier-one`, `sshd`…). `ss -p`
    without root does not show other users' processes; the widget guesses them
    from ports and remote names (41641 / derp*.tailscale.com → tailscaled,
    9993 → zerotier-one, 22 → ssh) and marks them "name guessed from port".
-   Full data, allowing exactly the two queries the collector runs — and nothing
+   `--setup ss` allows exactly the two queries the collector runs — and nothing
    else, so `ss -K` (which can destroy sockets) stays behind a password:
-   ```bash
-   f=$(mktemp) && printf '%s\n' "$USER ALL=(root) NOPASSWD: /usr/bin/ss -tunpHO, /usr/bin/ss -tulnpHO" > "$f" \
-     && sudo visudo -cqf "$f" && sudo install -m 440 -o root -g root "$f" /etc/sudoers.d/omarchy-bananet-ss && rm -f "$f"
    ```
-   If you installed the earlier, unrestricted rule, replace it:
-   `sudo rm -f /etc/sudoers.d/omarchy-bananet-ss` and run the command above.
+   Cmnd_Alias BANANET_SS = /usr/bin/ss -tunpHO, /usr/bin/ss -tulnpHO
+   Defaults!BANANET_SS env_reset, !setenv, secure_path="/usr/bin:/bin"
+   #1000 ALL=(root) NOPASSWD: NOSETENV: BANANET_SS
+   ```
+   If you installed an earlier rule (`/etc/sudoers.d/omarchy-bananet-ss` or
+   `omarchy-tunnels-ss`), `--setup ss` replaces the former; remove the latter
+   with `sudo rm -f /etc/sudoers.d/omarchy-tunnels-ss`.
+
+To undo any of them: `sudo rm -f /etc/sudoers.d/omarchy-bananet-NAME`.
 
 ## Traffic history
 
@@ -188,7 +212,10 @@ through.
 - `BananaIcon.qml` — the banana icon drawn on a Canvas
 - `collect.py` — collector: `ip -j`, `/proc/net/dev`, `nmcli`, `resolvectl`,
   `tailscale status --json`, `zerotier-cli -j`, `wg show all dump`, `ss -tunp`.
-  Run it by hand: `python3 collect.py --history | jq .`
+  Every child runs with a clean environment, a deadline and a byte ceiling;
+  the JSON it prints is bounded in size. Run it by hand:
+  `python3 -I collect.py --history | jq .` — and `python3 -I collect.py --setup NAME`
+  installs an optional sudoers rule (see *Privileges*).
 
 ## Manage
 

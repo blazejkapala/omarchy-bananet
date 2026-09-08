@@ -14,17 +14,33 @@ Runs without root. Some detail needs extra privileges and degrades gracefully:
   * `wg show` and `zerotier-cli` answer fully only to root
 The collector tries `sudo -n` once for each and remembers the answer for 10 minutes.
 It never runs anything under sudo beyond the read-only commands in SUDO_ALLOWED,
-and never copies a daemon's credentials anywhere; the optional sudoers rules the
-README documents name exactly those commands with exactly those arguments.
+and never copies a daemon's credentials anywhere.
+
+Boundaries, so the reader does not have to hunt for them:
+  * every external program is a fixed absolute path in BIN; nothing is looked up
+    through PATH, and sudo is only ever asked for the exact vectors in SUDO_ALLOWED
+  * every child process gets a clean environment, a hard deadline, a byte ceiling
+    on both pipes and its own process group (killed as a whole on overrun)
+  * cache files are read through O_NOFOLLOW descriptors with owner/type/size checks
+    and written through exclusive temporaries + atomic rename in a 0700 directory
+  * `--setup NAME` installs the optional sudoers rule: the rule bytes are generated,
+    validated with visudo and published atomically by ROOT_INSTALLER, a root-side
+    Python program passed to `sudo python3 -I -` on stdin, so root never opens a
+    file from this (user-writable) directory
+  * the JSON document is bounded (string lengths and list sizes) before it is printed
 """
 import http.client
 import ipaddress
 import json
 import os
 import re
+import shlex
+import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -72,40 +88,352 @@ LOOPBACK_RE = re.compile(r"^(127\.|::1$|0\.0\.0\.0$|::$)")
 WARNINGS = []
 SETUP = []
 
+# Fixed, canonical locations of every external program the collector runs.
+# Nothing is resolved through PATH: a writable PATH entry must never be able to
+# redirect a command, least of all one that ends up in a sudoers rule.
+BIN = {
+    "ip": "/usr/bin/ip",
+    "nmcli": "/usr/bin/nmcli",
+    "resolvectl": "/usr/bin/resolvectl",
+    "ss": "/usr/bin/ss",
+    "pgrep": "/usr/bin/pgrep",
+    "tailscale": "/usr/bin/tailscale",
+    "zerotier-cli": "/usr/bin/zerotier-cli",
+    "wg": "/usr/bin/wg",
+    "openvpn": "/usr/bin/openvpn",
+    "sudo": "/usr/bin/sudo",
+    "python3": "/usr/bin/python3",
+}
+SELF = os.path.realpath(__file__)
+
 # Every command the collector may run through sudo, in full. sudo_run refuses
 # anything else, so the sudoers rules the setup cards offer can name these exact
 # argument vectors: read-only queries, no wildcards, no root command surface
 # beyond what is listed here.
 SUDO_ALLOWED = (
-    ("zerotier-cli", "-j", "listnetworks"),
-    ("zerotier-cli", "-j", "listpeers"),
-    ("wg", "show", "all", "dump"),
-    ("ss", "-tunpHO"),
-    ("ss", "-tulnpHO"),
+    (BIN["zerotier-cli"], "-j", "listnetworks"),
+    (BIN["zerotier-cli"], "-j", "listpeers"),
+    (BIN["wg"], "show", "all", "dump"),
+    (BIN["ss"], "-tunpHO"),
+    (BIN["ss"], "-tulnpHO"),
 )
 
+# One optional sudoers snippet per setup card. The table is repeated verbatim
+# inside ROOT_INSTALLER below, which is the only code that ever writes a rule.
+SUDO_RULES = {
+    "zerotier": ("BANANET_ZEROTIER", SUDO_ALLOWED[0:2]),
+    "wg": ("BANANET_WG", SUDO_ALLOWED[2:3]),
+    "ss": ("BANANET_SS", SUDO_ALLOWED[3:5]),
+}
 
-def sudoers_command(name, specs):
-    """Shell one-liner installing an exact-command sudoers rule. visudo checks the
-    file before it is put in place, so a typo can never lock sudo out."""
-    rule = "$USER ALL=(root) NOPASSWD: " + ", ".join(specs)
-    return ("f=$(mktemp) && printf '%%s\\n' \"%s\" > \"$f\" && sudo visudo -cqf \"$f\" "
-            "&& sudo install -m 440 -o root -g root \"$f\" /etc/sudoers.d/omarchy-bananet-%s "
-            "&& rm -f \"$f\" && echo OK") % (rule, name)
+# Children never inherit the widget's environment: no BASH_ENV/PYTHON*/LD_* and
+# a fixed PATH (only used by the child for its own helpers; we exec by path).
+CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": HOME}
+OUTPUT_MAX = 4 * 1024 * 1024   # stdout ceiling per child (ss/tailscale on a busy box is ~100 kB)
+STDERR_MAX = 64 * 1024
+CACHE_MAX = 1024 * 1024        # per JSON cache file
+HISTORY_MAX = 4 * 1024 * 1024  # 24 h of samples is ~600 kB
+MAX_STR = 512                  # longest string that reaches the panel
+MAX_LIST = 4000                # longest list that reaches the panel (24 h history = 2880 samples)
 
 
-def tool_path(name):
-    return which(name) or "/usr/bin/" + name
+def installed(name):
+    path = BIN[name]
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def trusted_binary(path):
+    """A sudo target must be a regular file under /usr/bin, owned by root and not
+    writable by anyone else; a symlink (zerotier-cli -> zerotier-one) must itself
+    be root-owned and resolve inside /usr/bin. Returns a reason when it is not."""
+    try:
+        link = os.lstat(path)
+        if link.st_uid != 0 or link.st_mode & 0o022:
+            return "%s is not root-owned/read-only" % path
+        real = os.path.realpath(path)
+        if not real.startswith("/usr/bin/"):
+            return "%s resolves outside /usr/bin (%s)" % (path, real)
+        st = os.stat(real)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            return "%s is not a root-owned read-only regular file" % real
+    except OSError as e:
+        return "%s: %s" % (path, e.strerror or e)
+    return ""
+
+
+def sudoers_text(name, uid):
+    """The exact bytes ROOT_INSTALLER writes, for display. Subject is the numeric
+    UID (a login such as `ALL` would change the meaning of a name-based rule);
+    NOSETENV/env_reset/secure_path close the caller-environment channel."""
+    alias, vectors = SUDO_RULES[name]
+    specs = ", ".join(" ".join(v) for v in vectors)
+    return ("# Installed by the Bananet Omarchy plugin for uid %d. Read-only queries only.\n"
+            "Cmnd_Alias %s = %s\n"
+            "Defaults!%s env_reset, !setenv, secure_path=\"/usr/bin:/bin\"\n"
+            "#%d ALL=(root) NOPASSWD: NOSETENV: %s\n") % (uid, alias, specs, alias, uid, alias)
+
+
+# Runs as root: `sudo /usr/bin/python3 -I - NAME` with this text on stdin. It is
+# self-contained on purpose: root generates the rule bytes itself from the fixed
+# table below, checks every target binary, validates the bytes with visudo inside
+# a private root-owned staging directory and publishes them with one rename.
+# Nothing is read from the caller except NAME (checked against the table) and
+# SUDO_UID (set by sudo itself, after env_reset).
+ROOT_INSTALLER = r'''
+import os, pwd, stat, subprocess, sys, tempfile
+
+RULES = {
+    "zerotier": ("BANANET_ZEROTIER", ("/usr/bin/zerotier-cli -j listnetworks", "/usr/bin/zerotier-cli -j listpeers")),
+    "wg": ("BANANET_WG", ("/usr/bin/wg show all dump",)),
+    "ss": ("BANANET_SS", ("/usr/bin/ss -tunpHO", "/usr/bin/ss -tulnpHO")),
+}
+SUDOERS_DIR = "/etc/sudoers.d"
+VISUDO = "/usr/bin/visudo"
+
+
+def die(msg):
+    sys.stderr.write("bananet-setup: %s\n" % msg)
+    sys.exit(1)
+
+
+def check_binary(path):
+    link = os.lstat(path)
+    if link.st_uid != 0 or link.st_mode & 0o022:
+        die("%s is not root-owned/read-only" % path)
+    real = os.path.realpath(path)
+    if not real.startswith("/usr/bin/"):
+        die("%s resolves outside /usr/bin" % path)
+    st = os.stat(real)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        die("%s is not a root-owned read-only regular file" % real)
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def main():
+    if os.geteuid() != 0:
+        die("must run as root (through sudo)")
+    if len(sys.argv) != 2 or sys.argv[1] not in RULES:
+        die("usage: python3 - {zerotier|wg|ss}")
+    name = sys.argv[1]
+    uid_s = os.environ.get("SUDO_UID", "")
+    if not uid_s.isdigit() or int(uid_s) == 0:
+        die("SUDO_UID is missing; run this through sudo")
+    uid = int(uid_s)
+    try:
+        pwd.getpwuid(uid)
+    except KeyError:
+        die("uid %d is not a local account" % uid)
+    alias, specs = RULES[name]
+    for spec in specs:
+        check_binary(spec.split()[0])
+    check_binary(VISUDO)
+    rule = ("# Installed by the Bananet Omarchy plugin for uid %d. Read-only queries only.\n"
+            "Cmnd_Alias %s = %s\n"
+            "Defaults!%s env_reset, !setenv, secure_path=\"/usr/bin:/bin\"\n"
+            "#%d ALL=(root) NOPASSWD: NOSETENV: %s\n") % (uid, alias, ", ".join(specs), alias, uid, alias)
+    data = rule.encode()
+    dst = os.lstat(SUDOERS_DIR)
+    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != 0 or dst.st_mode & 0o022:
+        die("%s is not a root-owned directory" % SUDOERS_DIR)
+    target = os.path.join(SUDOERS_DIR, "omarchy-bananet-" + name)
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            current = os.read(fd, len(data) + 1)
+        finally:
+            os.close(fd)
+        if current == data:
+            sys.stdout.write(rule + "\nAlready installed as %s, nothing changed.\n" % target)
+            return
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        die("cannot inspect %s: %s" % (target, e))
+    # Staging directory: root-owned 0700 inside sudoers.d (same filesystem, so
+    # the final rename is atomic); sudo ignores names containing a dot, so the
+    # unvalidated file is never part of the policy.
+    staging = tempfile.mkdtemp(prefix=".omarchy-bananet.", dir=SUDOERS_DIR)
+    tmp = os.path.join(staging, "rule")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o440)
+        try:
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        rc = subprocess.run([VISUDO, "-cqf", tmp], stdin=subprocess.DEVNULL,
+                            env={"PATH": "/usr/bin:/bin"}, timeout=15).returncode
+        if rc != 0:
+            die("visudo rejected the rule; nothing was installed")
+        os.rename(tmp, target)
+        fsync_dir(SUDOERS_DIR)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        try:
+            os.rmdir(staging)
+        except OSError:
+            pass
+    sys.stdout.write(rule + "\nInstalled %s\n" % target)
+
+
+main()
+'''
+
+
+def setup_command(name):
+    return " ".join(shlex.quote(x) for x in (BIN["python3"], "-I", SELF, "--setup", name))
+
+
+def setup_card(name, title, detail, iface, minor=False):
+    """Offer a sudoers rule only when every target is a trusted binary; otherwise
+    say why instead."""
+    for vector in SUDO_RULES[name][1]:
+        why = trusted_binary(vector[0])
+        if why:
+            WARNINGS.append("%s: not offering a sudo rule, %s" % (title, why))
+            return
+    SETUP.append({
+        "id": name,
+        "title": title,
+        "detail": detail,
+        "command": setup_command(name),
+        "rule": sudoers_text(name, os.getuid()),
+        "iface": iface,
+        "minor": minor,
+    })
+
+
+def cmd_setup(name):
+    """`collect.py --setup NAME`, run in a terminal by the panel or by hand."""
+    if name not in SUDO_RULES:
+        sys.stderr.write("usage: collect.py --setup {%s}\n" % "|".join(SUDO_RULES))
+        return 2
+    for vector in SUDO_RULES[name][1]:
+        why = trusted_binary(vector[0])
+        if why:
+            sys.stderr.write("refusing: %s\n" % why)
+            return 1
+    sys.stdout.write("Bananet: optional sudo rule '%s'\n\n" % name)
+    sys.stdout.write("This will install /etc/sudoers.d/omarchy-bananet-%s with exactly:\n\n%s\n" % (name, sudoers_text(name, os.getuid())))
+    sys.stdout.write("sudo will ask for your password. The rule is generated, checked with\n"
+                     "visudo and installed by a small root-side program sent to python3 on\n"
+                     "stdin; root reads nothing from this plugin directory.\n\n")
+    sys.stdout.flush()
+    env = dict(CLEAN_ENV)
+    for key in ("TERM", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    try:
+        rc = subprocess.run([BIN["sudo"], "--", BIN["python3"], "-I", "-", name],
+                            input=ROOT_INSTALLER.encode(), env=env, timeout=600).returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.stdout.write("\nsudo failed: %s\n" % e)
+        rc = 1
+    sys.stdout.write("\n%s\n" % ("Done. The widget picks the rule up on its next refresh." if rc == 0 else "Nothing was installed."))
+    try:
+        input("Press Enter to close this window.")
+    except EOFError:
+        pass
+    return rc
 
 
 # --------------------------------------------------------------------------- helpers
 
-def run(cmd, timeout=2.5):
+_children = set()
+
+
+def _kill_group(p):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr
-    except (OSError, subprocess.TimeoutExpired) as e:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _on_term(signum, frame):
+    for p in list(_children):
+        _kill_group(p)
+    os._exit(1)
+
+
+signal.signal(signal.SIGTERM, _on_term)
+
+
+def _drain(pipe, limit, sink):
+    """Read a pipe in chunks and stop (flagging overrun) once limit is exceeded,
+    so an over-talkative child never lands in memory."""
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read1(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                sink["over"] = True
+                break
+            sink["chunks"].append(chunk)
+    except (OSError, ValueError):
+        pass
+
+
+def run(cmd, timeout=2.5, max_bytes=OUTPUT_MAX):
+    """Run an absolute-path command in its own process group with a clean
+    environment, a hard deadline and byte ceilings on both pipes. Overrun or
+    timeout kills the whole group and counts as failure."""
+    if not cmd or not os.path.isabs(cmd[0]):
+        return -1, "", "refusing to run a relative command"
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=CLEAN_ENV, start_new_session=True, close_fds=True)
+    except OSError as e:
         return -1, "", str(e)
+    _children.add(p)
+    out = {"chunks": [], "over": False}
+    err = {"chunks": [], "over": False}
+    readers = [threading.Thread(target=_drain, args=(p.stdout, max_bytes, out), daemon=True),
+               threading.Thread(target=_drain, args=(p.stderr, STDERR_MAX, err), daemon=True)]
+    for t in readers:
+        t.start()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while True:
+        try:
+            p.wait(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if out["over"] or err["over"] or time.monotonic() > deadline:
+            timed_out = not (out["over"] or err["over"])
+            _kill_group(p)
+            p.wait()
+            break
+    for t in readers:
+        t.join(1.0)
+    for pipe in (p.stdout, p.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    _children.discard(p)
+    name = os.path.basename(cmd[0])
+    if out["over"] or err["over"]:
+        return -1, "", "%s: output exceeds %d bytes" % (name, max_bytes)
+    if timed_out:
+        return -1, "", "%s: no answer within %.1fs" % (name, timeout)
+    return p.returncode, b"".join(out["chunks"]).decode("utf-8", "replace"), b"".join(err["chunks"]).decode("utf-8", "replace")
 
 
 def run_json(cmd, timeout=2.5):
@@ -118,29 +446,97 @@ def run_json(cmd, timeout=2.5):
         return None
 
 
-def which(name):
-    for d in os.environ.get("PATH", "/usr/bin:/bin").split(":"):
-        p = os.path.join(d, name)
-        if os.access(p, os.X_OK):
-            return p
-    return None
+def clip(value, limit=MAX_STR):
+    return str(value if value is not None else "")[:limit]
 
 
-def load_json_file(path, default):
+def bound(obj):
+    """Final guard before the document is printed: no string longer than
+    MAX_STR, no list or object with more than MAX_LIST entries."""
+    if isinstance(obj, str):
+        return obj[:MAX_STR]
+    if isinstance(obj, list):
+        return [bound(x) for x in obj[:MAX_LIST]]
+    if isinstance(obj, dict):
+        return {str(k)[:MAX_STR]: bound(v) for k, v in list(obj.items())[:MAX_LIST]}
+    return obj
+
+
+def ensure_cache_dir():
+    """The cache directory must be ours, private (0700) and not a symlink."""
     try:
-        with open(path) as f:
-            return json.load(f)
+        os.mkdir(CACHE_DIR, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(CACHE_DIR)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError("%s is not a directory owned by this user" % CACHE_DIR)
+    if st.st_mode & 0o077:
+        os.chmod(CACHE_DIR, 0o700)
+
+
+def read_private_file(path, max_bytes):
+    """Descriptor-bound read: no symlink following, regular file owned by this
+    user, at most max_bytes. Anything else is an error, never data."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > max_bytes:
+            raise OSError("%s is not a private regular file under %d bytes" % (path, max_bytes))
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError("%s grew past %d bytes" % (path, max_bytes))
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_private_file(path, data):
+    """Exclusive random-named 0600 temporary in the cache directory, fsync,
+    atomic rename, directory fsync."""
+    ensure_cache_dir()
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=CACHE_DIR)
+    try:
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, path)
+    except OSError:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(CACHE_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def load_json_file(path, default, max_bytes=CACHE_MAX):
+    try:
+        value = json.loads(read_private_file(path, max_bytes).decode("utf-8", "replace"))
     except (OSError, ValueError):
         return default
+    return value if isinstance(value, type(default)) else default
 
 
 def save_json_file(path, value):
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(value, f)
-        os.replace(tmp, path)
+        write_private_file(path, json.dumps(value, separators=(",", ":")).encode())
     except OSError:
         pass
 
@@ -169,7 +565,7 @@ def sudo_run(cmd, key, timeout=2.5):
             pass
     if entry and not entry.get("ok") and now - entry.get("ts", 0) < 600 and entry.get("ts", 0) > sudoers_mtime:
         return -1, "", "sudo needs password"
-    rc, out, err = run(["sudo", "-n"] + cmd, timeout)
+    rc, out, err = run([BIN["sudo"], "-n", "--"] + list(cmd), timeout)
     needs_pw = rc != 0 and ("password" in err.lower() or "a terminal is required" in err.lower())
     _sudo_state[key] = {"ok": rc == 0, "ts": now}
     save_json_file(SUDO_CACHE, _sudo_state)
@@ -240,7 +636,7 @@ def read_proc_net_dev():
 
 def nm_devices():
     devices = {}
-    rc, out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev", "status"])
+    rc, out, _ = run([BIN["nmcli"], "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev", "status"])
     if rc != 0:
         return devices
     for line in out.splitlines():
@@ -253,7 +649,7 @@ def nm_devices():
 
 def nm_active_connections():
     conns = []
-    rc, out, _ = run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE,UUID", "con", "show", "--active"])
+    rc, out, _ = run([BIN["nmcli"], "-t", "-f", "NAME,TYPE,DEVICE,UUID", "con", "show", "--active"])
     if rc != 0:
         return conns
     for line in out.splitlines():
@@ -264,7 +660,7 @@ def nm_active_connections():
 
 
 def nm_wifi_active():
-    rc, out, _ = run(["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,FREQ,RATE", "dev", "wifi", "list", "--rescan", "no"])
+    rc, out, _ = run([BIN["nmcli"], "-t", "-f", "ACTIVE,SSID,SIGNAL,FREQ,RATE", "dev", "wifi", "list", "--rescan", "no"])
     if rc != 0:
         return None
     for line in out.splitlines():
@@ -276,7 +672,7 @@ def nm_wifi_active():
 
 
 def nm_connection_fields(name):
-    rc, out, _ = run(["nmcli", "-t", "connection", "show", name])
+    rc, out, _ = run([BIN["nmcli"], "-t", "connection", "show", "id", name])  # `id` keyword: a name starting with "-" is never an option
     fields = {}
     if rc != 0:
         return fields
@@ -339,7 +735,7 @@ def parse_wg_dump(text):
 def collect_routes():
     routes = []
     for family in ("-4", "-6"):
-        data = run_json(["ip", "-j", family, "route", "show", "table", "all"]) or []
+        data = run_json([BIN["ip"], "-j", family, "route", "show", "table", "all"]) or []
         for r in data:
             if r.get("table") == "local" or r.get("type") in ("local", "broadcast", "multicast", "anycast"):
                 continue
@@ -360,7 +756,7 @@ def collect_routes():
 def collect_rules():
     rules = []
     for family in ("-4", "-6"):
-        for r in run_json(["ip", "-j", family, "rule", "show"]) or []:
+        for r in run_json([BIN["ip"], "-j", family, "rule", "show"]) or []:
             desc = "from %s" % r.get("src", "all")
             if r.get("fwmark"):
                 desc += " fwmark %s" % r["fwmark"]
@@ -375,7 +771,11 @@ def collect_rules():
 
 
 def route_get(target, v6=False):
-    cmd = ["ip", "-j"] + (["-6"] if v6 else []) + ["route", "get", target]
+    try:
+        target = str(ipaddress.ip_address(target))   # only a literal address ever reaches `ip`
+    except ValueError:
+        return None
+    cmd = [BIN["ip"], "-j"] + (["-6"] if v6 else []) + ["route", "get", target]
     data = run_json(cmd, 1.5)
     if not data:
         return None
@@ -385,13 +785,13 @@ def route_get(target, v6=False):
 
 def collect_dns():
     servers, domains, default_route = {}, {}, {}
-    rc, out, _ = run(["resolvectl", "dns"])
+    rc, out, _ = run([BIN["resolvectl"], "dns"])
     if rc == 0:
         for line in out.splitlines():
             m = re.match(r"^(Global|Link \d+ \(([^)]+)\)):\s*(.*)$", line.strip())
             if m:
                 servers[m.group(2) or "global"] = m.group(3).split()
-    rc, out, _ = run(["resolvectl", "domain"])
+    rc, out, _ = run([BIN["resolvectl"], "domain"])
     if rc == 0:
         current = None
         for line in out.splitlines():
@@ -401,7 +801,7 @@ def collect_dns():
                 domains[current] = m.group(3).split()
             elif current and line.startswith(" "):
                 domains[current].extend(line.split())
-    rc, out, _ = run(["resolvectl", "default-route"])
+    rc, out, _ = run([BIN["resolvectl"], "default-route"])
     if rc == 0:
         for line in out.splitlines():
             m = re.match(r"^(Global|Link \d+ \(([^)]+)\)):\s*(.*)$", line.strip())
@@ -413,9 +813,9 @@ def collect_dns():
 # --------------------------------------------------------------------------- tunnels
 
 def collect_tailscale():
-    if not which("tailscale"):
+    if not installed("tailscale"):
         return None
-    status = run_json(["tailscale", "status", "--json"], 3.5)
+    status = run_json([BIN["tailscale"], "status", "--json"], 3.5)
     if not status:
         return {"installed": True, "state": "Unavailable"}
     self_node = status.get("Self") or {}
@@ -478,11 +878,11 @@ def collect_tailscale():
 
 def zerotier_cli(args):
     """Try without root (user token) then sudo -n."""
-    rc, out, err = run(["zerotier-cli", "-j"] + args, 3)
+    rc, out, err = run([BIN["zerotier-cli"], "-j"] + args, 3)
     if rc == 0 and out.strip():
         return out, ""
     if "authtoken" in (err + out).lower() or rc != 0:
-        rc2, out2, err2 = sudo_run(["zerotier-cli", "-j"] + args, "zerotier", 3)
+        rc2, out2, err2 = sudo_run([BIN["zerotier-cli"], "-j"] + args, "zerotier", 3)
         if rc2 == 0 and out2.strip():
             return out2, ""
         return "", (err or out or err2).strip()
@@ -490,21 +890,16 @@ def zerotier_cli(args):
 
 
 def collect_zerotier():
-    if not which("zerotier-cli"):
+    if not installed("zerotier-cli"):
         return None
     out, err = zerotier_cli(["listnetworks"])
     if not out:
         hint = ""
         if "authtoken" in err.lower() or "as root" in err.lower():
-            zt = tool_path("zerotier-cli")
             hint = "zerotier-cli needs root (or the daemon's auth token) to answer. Allow the two read-only queries below and networks, peers and latency will show up here."
-            SETUP.append({
-                "id": "zerotier",
-                "title": "ZeroTier needs a one-time setup",
-                "detail": "Without it only the interface and routes are visible. Click to open a terminal with the command (sudo will ask for your password); right click copies it. It allows exactly two read-only queries, nothing else.",
-                "command": sudoers_command("zerotier", ["%s -j listnetworks" % zt, "%s -j listpeers" % zt]),
-                "iface": "zerotier",
-            })
+            setup_card("zerotier", "ZeroTier needs a one-time setup",
+                       "Without it only the interface and routes are visible. Click to open a terminal that installs the sudo rule below (sudo asks for your password); right click copies the command. It allows exactly two read-only queries, nothing else.",
+                       "zerotier")
         else:
             WARNINGS.append("ZeroTier: " + (err or "zerotier-cli is not responding"))
         return {"installed": True, "available": False, "error": err, "hint": hint, "networks": [], "peers": []}
@@ -555,20 +950,16 @@ def collect_wireguard(links, active_conns):
     devs = [l["name"] for l in links if l.get("infoKind") == "wireguard"]
     result = {}
     dump = {}
-    if devs and which("wg"):
-        rc, out, err = run(["wg", "show", "all", "dump"], 2)
+    if devs and installed("wg"):
+        rc, out, err = run([BIN["wg"], "show", "all", "dump"], 2)
         if rc != 0:
-            rc, out, err = sudo_run(["wg", "show", "all", "dump"], "wg", 2)
+            rc, out, err = sudo_run([BIN["wg"], "show", "all", "dump"], "wg", 2)
         if rc == 0:
             dump = parse_wg_dump(out)
         else:
-            SETUP.append({
-                "id": "wireguard",
-                "title": "WireGuard: no access to `wg show`",
-                "detail": "Peers, endpoints and handshakes need root. Click to add a passwordless sudo rule for the single command `wg show all dump` (asks for your password); right click copies it.",
-                "command": sudoers_command("wg", ["%s show all dump" % tool_path("wg")]),
-                "iface": "wireguard",
-            })
+            setup_card("wg", "WireGuard: no access to `wg show`",
+                       "Peers, endpoints and handshakes need root. Click to open a terminal that installs a sudo rule for the single command `wg show all dump` (asks for your password); right click copies the command.",
+                       "wireguard")
     elif devs:
         WARNINGS.append("WireGuard: wireguard-tools (`wg`) is not installed; showing NetworkManager data only.")
     nm_by_dev = {c["device"]: c for c in active_conns if c["type"] == "wireguard"}
@@ -589,7 +980,7 @@ def collect_wireguard(links, active_conns):
 
 def collect_openvpn(links, active_conns):
     result = {}
-    rc, out, _ = run(["pgrep", "-a", "-x", "openvpn"])
+    rc, out, _ = run([BIN["pgrep"], "-a", "-x", "openvpn"])
     procs = []
     if rc == 0:
         for line in out.splitlines():
@@ -639,7 +1030,7 @@ def collect_tools():
     is asked of the user for a tool that is simply not there."""
     out = []
     for name, label in TOOLS:
-        out.append({"name": name, "label": label, "found": bool(which(name))})
+        out.append({"name": name, "label": label, "found": installed(name)})
     return out
 
 
@@ -777,6 +1168,8 @@ def collect_public(egress4, egress6, exit_node):
 def parse_ss(text, listening=False):
     rows = []
     for line in text.splitlines():
+        if len(rows) >= MAX_LIST:
+            break
         parts = line.split()
         if len(parts) < 6:
             continue
@@ -789,12 +1182,12 @@ def parse_ss(text, listening=False):
         m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', users)
         if m:
             proc, pid = m.group(1), int(m.group(2))
-        rows.append({"proto": proto, "state": state, "lip": lip, "lport": lport, "lscope": lscope, "rip": rip, "rport": rport, "proc": proc, "pid": pid})
+        rows.append({"proto": clip(proto, 16), "state": clip(state, 16), "lip": clip(lip, 64), "lport": lport, "lscope": clip(lscope, 32), "rip": clip(rip, 64), "rport": rport, "proc": clip(proc, 64), "pid": pid})
     return rows
 
 
 def collect_sockets():
-    cmd = ["ss", "-tunpHO"]
+    cmd = [BIN["ss"], "-tunpHO"]
     rc, out, err = run(cmd)
     privileged = False
     if OPTS["sudo"]:
@@ -802,9 +1195,9 @@ def collect_sockets():
         if rc2 == 0:
             out, privileged = out2, True
     conns = parse_ss(out) if out else []
-    rc, lout, _ = run(["ss", "-tulnpHO"])
+    rc, lout, _ = run([BIN["ss"], "-tulnpHO"])
     if privileged:
-        rc2, lout2, _ = sudo_run(["ss", "-tulnpHO"], "ss-listen", 2.5)
+        rc2, lout2, _ = sudo_run([BIN["ss"], "-tulnpHO"], "ss-listen", 2.5)
         if rc2 == 0:
             lout = lout2
     listeners = parse_ss(lout, listening=True) if lout else []
@@ -836,7 +1229,7 @@ def resolve_names(ips):
 
     def worker(ip):
         try:
-            answers[ip] = socket.gethostbyaddr(ip)[0]
+            answers[ip] = socket.gethostbyaddr(ip)[0][:253]
         except (socket.herror, socket.gaierror, OSError):
             answers[ip] = ""
 
@@ -875,10 +1268,10 @@ def record_history(counters, now):
     """
     lines = []
     try:
-        with open(HISTORY_FILE) as f:
-            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        lines = [ln for ln in read_private_file(HISTORY_FILE, HISTORY_MAX).decode("utf-8", "replace").splitlines() if ln.strip()]
     except OSError:
         pass
+    lines = lines[-MAX_LIST:]
     last_ts = 0.0
     if lines:
         try:
@@ -903,11 +1296,7 @@ def record_history(counters, now):
             changed = True
     if changed:
         try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            tmp = HISTORY_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                f.write("\n".join(kept) + ("\n" if kept else ""))
-            os.replace(tmp, HISTORY_FILE)
+            write_private_file(HISTORY_FILE, ("\n".join(kept) + ("\n" if kept else "")).encode())
         except OSError:
             pass
     if not OPTS["history"]:
@@ -1037,6 +1426,8 @@ def demo_output(now):
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--setup":
+        sys.exit(cmd_setup(args[1] if len(args) > 1 else ""))
     i = 0
     while i < len(args):
         a = args[i]
@@ -1055,12 +1446,15 @@ def main():
         elif a == "--public-now":
             OPTS["public_now"] = True
         elif a == "--max-rdns" and i + 1 < len(args):
-            OPTS["max_rdns"] = int(args[i + 1]); i += 1
+            OPTS["max_rdns"] = max(0, min(32, int(args[i + 1]))); i += 1
         elif a == "--labels" and i + 1 < len(args):
+            # Custom interface names from the widget settings: a small flat map.
             try:
-                OPTS["labels"] = json.loads(args[i + 1])
+                raw = json.loads(args[i + 1][:8192])
             except ValueError:
-                pass
+                raw = {}
+            if isinstance(raw, dict):
+                OPTS["labels"] = {clip(k, 32): clip(v, 64) for k, v in list(raw.items())[:64] if isinstance(v, (str, int, float))}
             i += 1
         i += 1
 
@@ -1069,8 +1463,8 @@ def main():
         json.dump(demo_output(started), sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return
-    links_raw = run_json(["ip", "-j", "-d", "link", "show"]) or []
-    addrs_raw = run_json(["ip", "-j", "addr", "show"]) or []
+    links_raw = run_json([BIN["ip"], "-j", "-d", "link", "show"]) or []
+    addrs_raw = run_json([BIN["ip"], "-j", "addr", "show"]) or []
     counters = read_proc_net_dev()
     history = record_history(counters, started)
     nm_devs = nm_devices()
@@ -1286,14 +1680,9 @@ def main():
     interfaces.sort(key=lambda i: (0 if i["isDefault"] else 1, order.get(i["kind"], 3), not i["active"], i["name"]))
 
     if not privileged_ss:
-        SETUP.append({
-            "id": "ss",
-            "title": "Root process names are guessed",
-            "detail": "`ss -p` without root cannot see tailscaled, sshd etc. Optional: click to allow the two exact read-only `ss` queries the collector runs (asks for your password); right click copies the command.",
-            "command": sudoers_command("ss", ["%s -tunpHO" % tool_path("ss"), "%s -tulnpHO" % tool_path("ss")]),
-            "iface": "",
-            "minor": True,
-        })
+        setup_card("ss", "Root process names are guessed",
+                   "`ss -p` without root cannot see tailscaled, sshd etc. Optional: click to open a terminal that installs a sudo rule for the two exact read-only `ss` queries the collector runs (asks for your password); right click copies the command.",
+                   "", minor=True)
     default_dns_dev = next((d for d, on in dns_default.items() if on and d != "global"), "")
     output = {
         "ts": time.time(),
@@ -1328,7 +1717,7 @@ def main():
         "history": history,
         "historyStep": HISTORY_STEP,
     }
-    json.dump(output, sys.stdout, ensure_ascii=False)
+    json.dump(bound(output), sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     sys.stdout.flush()
 
@@ -1338,11 +1727,14 @@ def linkless_sorted(links):
 
 
 if __name__ == "__main__":
+    code = 0
     try:
         main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
     except Exception as e:  # never leave the widget without a document
-        json.dump({"error": "%s: %s" % (type(e).__name__, e), "ts": time.time(), "interfaces": [], "processes": [], "listeners": [], "warnings": [], "setup": []}, sys.stdout)
+        json.dump({"error": clip("%s: %s" % (type(e).__name__, e)), "ts": time.time(), "interfaces": [], "processes": [], "listeners": [], "warnings": [], "setup": []}, sys.stdout)
         sys.stdout.write("\n")
     finally:
         sys.stdout.flush()
-        os._exit(0)
+        os._exit(code)   # do not wait for stray rdns threads

@@ -190,7 +190,12 @@ Panel {
   }
 
   function handleOutput(text) {
-    var raw = String(text || "").trim()
+    var raw = String(text || "")
+    if (raw.length > maxDocumentChars) {
+      lastError = "Collector output too large (" + raw.length + " chars), ignored"
+      return
+    }
+    raw = raw.trim()
     if (raw === "") return
     try {
       applySample(JSON.parse(raw))
@@ -200,8 +205,22 @@ Panel {
     }
   }
 
+  // Fixed absolute paths only (never PATH lookups): the interpreter, the
+  // terminal launcher and wl-copy. `-I` keeps PYTHON* variables and the
+  // user site directory out of the collector.
+  readonly property string pythonBin: "/usr/bin/python3"
+  readonly property string terminalBin: "/usr/bin/omarchy-launch-terminal"
+  readonly property string clipboardBin: "/usr/bin/wl-copy"
+  readonly property int maxDocumentChars: 8 * 1024 * 1024
+
+  // Strings that end up in components we do not own (tooltips) go through
+  // this: with the default AutoText a "<b>" in a process name would be markup.
+  function plain(value) {
+    return String(value === undefined || value === null ? "" : value).replace(/</g, "\u2039").replace(/>/g, "\u203a")
+  }
+
   function collectorArgs() {
-    var args = ["python3", scriptPath]
+    var args = [pythonBin, "-I", scriptPath]
     if (!resolveNames) args.push("--no-rdns")
     if (!useSudo) args.push("--no-sudo")
     if (showLoopback) args.push("--loopback")
@@ -352,11 +371,14 @@ Panel {
     for (var i = 0; i < setupItems.length; i++) if (setupItems[i].iface === kind) return setupItems[i]
     return null
   }
+  // The card names a rule id; collect.py --setup <id> prints the exact rule
+  // and hands a self-contained root-side installer to `sudo python3 -I -` on
+  // stdin. No shell, no generated command string, nothing root reopens here.
   function runSetup(item) {
-    if (!item || !item.command) return
-    var script = "echo " + Util.shellQuote("# " + item.title) + "; echo " + Util.shellQuote("$ " + item.command) + "; echo; " + item.command + "; echo; read -rp 'Done. Press Enter to close this window.'; "
-    Quickshell.execDetached(["omarchy-launch-terminal", "bash", "-c", script])
-    actionStatus = "Opening a terminal with the command…"
+    if (!item || !item.id) return
+    if (!/^[a-z]+$/.test(String(item.id))) return
+    Quickshell.execDetached([terminalBin, pythonBin, "-I", scriptPath, "--setup", String(item.id)])
+    actionStatus = "Opening a terminal for the sudo rule…"
     actionStatusTimer.restart()
     delayedRefresh.restart()
   }
@@ -421,7 +443,7 @@ Panel {
       iconComponent: root.iconStyle === "banana" ? bananaIcon : null
       useActiveColor: false
       foreground: root.barIconColor
-      tooltipText: root.showTooltip ? root.barTooltip : ""
+      tooltipText: root.showTooltip ? root.plain(root.barTooltip) : ""
       onPressed: function(b) { root.handlePress(b) }
     }
 
@@ -438,7 +460,7 @@ Panel {
       horizontalMargin: 3
       foreground: root.barIconColor
       useActiveColor: false
-      tooltipText: root.showTooltip ? root.barTooltip : ""
+      tooltipText: root.showTooltip ? root.plain(root.barTooltip) : ""
       onPressed: function(b) { root.handlePress(b) }
     }
   }
@@ -581,9 +603,34 @@ Panel {
   function copyText(value, label) {
     var text = String(value || "")
     if (text === "") return
-    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
+    if (text.length > 65536) text = text.slice(0, 65536)
+    clipboard.running = false
+    clipboard.payload = text
+    clipboard.stdinEnabled = true
+    clipboard.running = true
     actionStatus = "Copied " + (label || "") + ": " + text
     actionStatusTimer.restart()
+  }
+
+  // wl-copy gets the text on stdin (argv is world-readable in /proc) and
+  // detaches itself to serve the selection; closing stdin is the EOF it waits for.
+  Process {
+    id: clipboard
+    property string payload: ""
+    command: [root.clipboardBin]
+    stdinEnabled: true
+    onStarted: {
+      write(payload)
+      payload = ""
+      stdinEnabled = false
+    }
+  }
+  Timer {
+    id: clipboardDeadline
+    interval: 5000
+    repeat: false
+    running: clipboard.running
+    onTriggered: clipboard.running = false
   }
 
   function ensureVisible(item) {
@@ -935,6 +982,7 @@ Panel {
           PanelHero {
             iconComponent: Component {
               Text {
+                textFormat: Text.PlainText
                 text: root.mainGlyph
                 color: root.foreground
                 font.family: root.fontFamily
@@ -965,6 +1013,7 @@ Panel {
             Repeater {
               model: JSON.parse(root.warningsJson)
               delegate: Text {
+                textFormat: Text.PlainText
                 required property var modelData
                 width: panelColumn.width
                 text: "⚠ " + modelData
@@ -976,6 +1025,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.lastError !== ""
               width: parent.width
               text: "⚠ " + root.lastError
@@ -1002,6 +1052,7 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(4)
                 Text {
+                  textFormat: Text.PlainText
                   text: "chart:"
                   color: root.dimmer
                   font.family: root.fontFamily
@@ -1046,6 +1097,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.loaded && root.ifaceKeys.length === 0
               text: "No interfaces"
               color: root.dim
@@ -1079,6 +1131,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.loaded && root.procKeys.length === 0
               text: "No active outgoing connections"
               color: root.dim
@@ -1120,6 +1173,7 @@ Panel {
                 spacing: Style.space(6)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: root.showListeners ? "󰅀" : "󰅂"
                   color: root.dim
                   font.family: root.fontFamily
@@ -1176,6 +1230,7 @@ Panel {
             PanelSeparator { foreground: root.foreground }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.actionStatus !== ""
               width: parent.width
               text: root.actionStatus
@@ -1186,6 +1241,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · r refresh · l listeners · e/w expand/collapse all · esc"
               color: root.dimmer
@@ -1195,6 +1251,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.toolsText !== ""
               width: parent.width
               text: root.toolsText
@@ -1205,6 +1262,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: (root.refreshing ? "refreshing… · " : "") + root.footerAge
               color: root.dimmer
@@ -1228,6 +1286,7 @@ Panel {
     spacing: Style.space(8)
 
     Text {
+      textFormat: Text.PlainText
       text: label
       width: Style.space(44)
       color: root.dim
@@ -1236,6 +1295,7 @@ Panel {
       font.bold: true
     }
     Text {
+      textFormat: Text.PlainText
       width: parent.width - Style.space(44) - Style.space(8)
       text: value
       color: urgentValue ? root.urgent : (dimValue ? root.dim : root.foreground)
@@ -1253,6 +1313,7 @@ Panel {
     Repeater {
       model: lines
       delegate: Text {
+        textFormat: Text.PlainText
         required property var modelData
         width: parent.width
         leftPadding: modelData.k === "item" ? Style.space(14) : 0
@@ -1299,7 +1360,7 @@ Panel {
 
       PanelToolTip {
         visible: ifaceMouse.containsMouse && !ifaceRow.expandedRow && ifaceRow.iface !== null
-        text: ifaceRow.iface ? root.ifaceTooltip(ifaceRow.iface) : ""
+        text: ifaceRow.iface ? root.plain(root.ifaceTooltip(ifaceRow.iface)) : ""
         fontFamily: root.fontFamily
       }
     }
@@ -1319,6 +1380,7 @@ Panel {
         spacing: Style.space(6)
 
         Text {
+          textFormat: Text.PlainText
           text: ifaceRow.iface ? root.kindGlyph(ifaceRow.iface.kind) : ""
           color: ifaceRow.inactive ? root.dimmer : root.foreground
           font.family: root.fontFamily
@@ -1328,6 +1390,7 @@ Panel {
           Layout.alignment: Qt.AlignVCenter
         }
         Text {
+          textFormat: Text.PlainText
           text: ifaceRow.iface ? ifaceRow.iface.name : ""
           color: ifaceRow.inactive ? root.dim : root.foreground
           font.family: root.fontFamily
@@ -1336,6 +1399,7 @@ Panel {
           Layout.alignment: Qt.AlignVCenter
         }
         Text {
+          textFormat: Text.PlainText
           text: ifaceRow.iface ? ifaceRow.iface.label : ""
           color: root.dim
           font.family: root.fontFamily
@@ -1353,6 +1417,7 @@ Panel {
           borderSpec: Border.controlSpec("normal", root.foreground, Color.accent)
           radius: Style.cornerRadius
           Text {
+            textFormat: Text.PlainText
             id: pillText
             anchors.centerIn: parent
             text: "INTERNET"
@@ -1363,6 +1428,7 @@ Panel {
           }
         }
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: ifaceRow.iface ? root.ifaceSubtitle(ifaceRow.iface) : ""
           color: root.dim
@@ -1372,6 +1438,7 @@ Panel {
           Layout.alignment: Qt.AlignVCenter
         }
         Text {
+          textFormat: Text.PlainText
           visible: !ifaceRow.inactive
           text: "↓ " + root.fmtRate(ifaceRow.rate.rx) + "  ↑ " + root.fmtRate(ifaceRow.rate.tx)
           color: (ifaceRow.rate.rx > 0 || ifaceRow.rate.tx > 0) ? root.foreground : root.dim
@@ -1380,6 +1447,7 @@ Panel {
           Layout.alignment: Qt.AlignVCenter
         }
         Text {
+          textFormat: Text.PlainText
           text: ifaceRow.expandedRow ? "󰅀" : "󰅂"
           color: root.dimmer
           font.family: root.fontFamily
@@ -1401,6 +1469,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: ifaceRow.expandedRow && !ifaceRow.inactive
         width: parent.width
         text: {
@@ -1436,6 +1505,7 @@ Panel {
     color: current ? root.selectedFill : (pillMouse.containsMouse ? root.hoverFill : "transparent")
     borderSpec: Border.controlSpec(current ? "selected" : "normal", root.foreground, Color.accent)
     Text {
+      textFormat: Text.PlainText
       id: pillLabel
       anchors.centerIn: parent
       text: pill.label
@@ -1590,7 +1660,7 @@ Panel {
 
       PanelToolTip {
         visible: setupMouse.containsMouse && setupRow.item !== null
-        text: setupRow.item ? ("Left click: open a terminal and run\nRight click: copy the command\n\n" + setupRow.item.command) : ""
+        text: setupRow.item ? root.plain("Left click: open a terminal and install the rule\nRight click: copy the command\n\n" + setupRow.item.command) : ""
         fontFamily: root.fontFamily
       }
     }
@@ -1605,6 +1675,7 @@ Panel {
       spacing: Style.space(10)
 
       Text {
+        textFormat: Text.PlainText
         text: setupRow.minor ? "󰋽" : "󱄊"
         color: setupRow.tint
         font.family: root.fontFamily
@@ -1617,6 +1688,7 @@ Panel {
         spacing: Style.space(2)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: setupRow.item ? setupRow.item.title : ""
           color: setupRow.minor ? root.foreground : root.urgent
@@ -1626,6 +1698,7 @@ Panel {
           wrapMode: Text.WordWrap
         }
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: setupRow.item ? setupRow.item.detail : ""
           color: root.dim
@@ -1634,8 +1707,9 @@ Panel {
           wrapMode: Text.WordWrap
         }
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: setupRow.item ? setupRow.item.command : ""
+          text: setupRow.item ? (setupRow.item.rule || setupRow.item.command) : ""
           color: setupRow.minor ? root.dim : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -1693,7 +1767,7 @@ Panel {
 
       PanelToolTip {
         visible: procMouse.containsMouse && !procRow.expandedRow && procRow.proc !== null
-        text: procRow.proc ? root.procTooltip(procRow.proc) : ""
+        text: procRow.proc ? root.plain(root.procTooltip(procRow.proc)) : ""
         fontFamily: root.fontFamily
       }
     }
@@ -1712,6 +1786,7 @@ Panel {
         spacing: Style.space(8)
 
         Text {
+          textFormat: Text.PlainText
           text: "󰆍"
           color: root.dim
           font.family: root.fontFamily
@@ -1725,6 +1800,7 @@ Panel {
           Layout.fillWidth: true
           spacing: Style.space(1)
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: procRow.proc ? procRow.proc.name : ""
             color: root.foreground
@@ -1734,6 +1810,7 @@ Panel {
             elide: Text.ElideRight
           }
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: procRow.proc ? root.procSubtitle(procRow.proc) : ""
             color: root.dim
@@ -1744,6 +1821,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: procRow.proc ? root.connWord(procRow.proc.count) : ""
           color: root.dim
           font.family: root.fontFamily
@@ -1752,6 +1830,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: procRow.expandedRow ? "󰅀" : "󰅂"
           color: root.dimmer
           font.family: root.fontFamily
@@ -1792,7 +1871,7 @@ Panel {
 
       PanelToolTip {
         visible: listenMouse.containsMouse && listenRow.listener !== null
-        text: listenRow.listener ? (listenRow.listener.proto + " " + listenRow.listener.addr + ":" + listenRow.listener.port + "\n" + root.listenScopeLabel(listenRow.listener) + (listenRow.listener.pid ? "\npid " + listenRow.listener.pid : "") + "\nClick to copy the address") : ""
+        text: listenRow.listener ? root.plain(listenRow.listener.proto + " " + listenRow.listener.addr + ":" + listenRow.listener.port + "\n" + root.listenScopeLabel(listenRow.listener) + (listenRow.listener.pid ? "\npid " + listenRow.listener.pid : "") + "\nClick to copy the address") : ""
         fontFamily: root.fontFamily
       }
     }
@@ -1807,6 +1886,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: listenRow.listener ? listenRow.listener.proto : ""
         width: Style.space(28)
         color: root.dim
@@ -1814,6 +1894,7 @@ Panel {
         font.pixelSize: Style.font.caption
       }
       Text {
+        textFormat: Text.PlainText
         text: listenRow.listener ? ":" + listenRow.listener.port : ""
         width: Style.space(52)
         color: root.foreground
@@ -1822,6 +1903,7 @@ Panel {
         font.bold: true
       }
       Text {
+        textFormat: Text.PlainText
         text: listenRow.listener ? listenRow.listener.proc : ""
         width: Style.space(150)
         color: listenRow.listener && listenRow.listener.guessed ? root.dim : root.foreground
@@ -1830,6 +1912,7 @@ Panel {
         elide: Text.ElideRight
       }
       Text {
+        textFormat: Text.PlainText
         text: listenRow.listener ? root.listenScopeLabel(listenRow.listener) : ""
         color: listenRow.listener && listenRow.listener.scope === "lo" ? root.dimmer : root.dim
         font.family: root.fontFamily
