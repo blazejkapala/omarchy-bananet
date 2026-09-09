@@ -27,6 +27,9 @@ Boundaries, so the reader does not have to hunt for them:
     validated with visudo and published atomically by ROOT_INSTALLER, a root-side
     Python program passed to `sudo python3 -I -` on stdin, so root never opens a
     file from this (user-writable) directory
+  * `--exit-node off|IP` is the one action the panel can trigger: the target is
+    parsed with ipaddress (or is the literal `off`) and `tailscale set` runs through
+    the same bounded run() as every query - no root involved
   * the JSON document is bounded (string lengths and list sizes) before it is printed
 """
 import http.client
@@ -348,6 +351,41 @@ def cmd_setup(name):
     except EOFError:
         pass
     return rc
+
+
+EXIT_NODE_TIMEOUT = 20.0
+
+
+def cmd_exit_node(target):
+    """`collect.py --exit-node off|IP`: the panel's two-click exit-node switch.
+
+    The target is either the literal `off` or an address that ipaddress accepts;
+    anything else is refused before tailscale is even named. The command runs
+    through run(): fixed path, clean environment, deadline, capped pipes. tailscaled
+    decides whether this user may change the setting (`tailscale set --operator`);
+    nothing here asks for more."""
+    target = str(target or "")
+    if len(target) > 45:
+        sys.stderr.write("refusing: exit-node target too long\n")
+        return 2
+    if target == "off":
+        value = ""
+    else:
+        try:
+            value = str(ipaddress.ip_address(target))
+        except ValueError:
+            sys.stderr.write("usage: collect.py --exit-node off|IP\n")
+            return 2
+    why = trusted_binary(BIN["tailscale"])
+    if why:
+        sys.stderr.write("refusing: %s\n" % why)
+        return 1
+    rc, out, err = run([BIN["tailscale"], "set", "--exit-node=" + value], timeout=EXIT_NODE_TIMEOUT, max_bytes=64 * 1024)
+    if out:
+        sys.stdout.write(out[:4096])
+    if err:
+        sys.stderr.write(err[:4096])
+    return rc if rc >= 0 else 1
 
 
 # --------------------------------------------------------------------------- helpers
@@ -1473,6 +1511,8 @@ def main():
     args = sys.argv[1:]
     if args and args[0] == "--setup":
         sys.exit(cmd_setup(args[1] if len(args) > 1 else ""))
+    if args and args[0] == "--exit-node":
+        sys.exit(cmd_exit_node(args[1] if len(args) > 1 else ""))
     i = 0
     while i < len(args):
         a = args[i]

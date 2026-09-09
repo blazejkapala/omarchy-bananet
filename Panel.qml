@@ -232,10 +232,10 @@ Panel {
     var lost = tunnelled(prev) && !tunnelled(now)
     if (lost) { egressAlert = true; egressAlertTimer.restart() }
     if (notifyEgress) {
-      Quickshell.execDetached(["notify-send", "-a", "Bananet",
+      Quickshell.execDetached([notifyBin, "-a", "Bananet",
                               "-u", lost ? "critical" : "normal",
                               lost ? "Bananet: traffic left the tunnel" : "Bananet: egress changed",
-                              egressLabelOf(prev) + "  →  " + egressLabelOf(now)])
+                              plain(egressLabelOf(prev) + "  →  " + egressLabelOf(now))])
     }
   }
 
@@ -261,6 +261,7 @@ Panel {
   readonly property string pythonBin: "/usr/bin/python3"
   readonly property string terminalBin: "/usr/bin/omarchy-launch-terminal"
   readonly property string clipboardBin: "/usr/bin/wl-copy"
+  readonly property string notifyBin: "/usr/bin/notify-send"
   readonly property int maxDocumentChars: 8 * 1024 * 1024
 
   // Strings that end up in components we do not own (tooltips) go through
@@ -673,12 +674,21 @@ Panel {
   // Two-step by design: the first click arms the action and shows the exact
   // command, the second runs it. Nothing here needs root; if tailscaled refuses,
   // the status line says which one-time `tailscale set --operator` fixes it.
+  // The target is the literal "off" or an address; collect.py parses it again
+  // with ipaddress before `tailscale set` is named. The command shown to the
+  // user is the one that ends up running (cmdText), built from the same target.
+  readonly property var exitNodeTarget: /^(off|[0-9a-fA-F:.]{1,45})$/
+  function actionCommandText(target) {
+    return "tailscale set --exit-node=" + (target === "off" ? "" : target)
+  }
   function runAction(item) {
-    if (!item || !item.cmd || !exitNodeSwitcher) return
+    if (!item || !exitNodeSwitcher) return
+    var target = String(item.target || "")
+    if (!exitNodeTarget.test(target)) return
     if (pendingActionId !== item.id) {
       pendingActionId = item.id
       pendingActionTimer.restart()
-      actionStatus = "Click again to run: " + item.cmd.join(" ")
+      actionStatus = "Click again to run: " + actionCommandText(target)
       actionStatusTimer.stop()
       return
     }
@@ -686,10 +696,19 @@ Panel {
     pendingActionTimer.stop()
     if (actionRunner.running) return
     actionRunner.label = item.t
-    actionRunner.command = item.cmd
+    actionRunner.command = [pythonBin, "-I", scriptPath, "--exit-node", target]
     actionRunner.running = true
-    actionStatus = "Running " + item.cmd.join(" ") + "…"
+    actionWatchdog.restart()
+    actionStatus = "Running " + actionCommandText(target) + "…"
     actionStatusTimer.stop()
+  }
+  // collect.py already caps and deadlines tailscale itself; this only covers
+  // the interpreter never coming back.
+  Timer {
+    id: actionWatchdog
+    interval: 30000
+    repeat: false
+    onTriggered: if (actionRunner.running) actionRunner.running = false
   }
 
   Process {
@@ -700,7 +719,8 @@ Panel {
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
-      var err = String(actionErr.text || "").trim()
+      actionWatchdog.stop()
+      var err = String(actionErr.text || "").trim().slice(-4096)
       if (exitCode === 0) {
         root.actionStatus = "Done: " + actionRunner.label
         root.refresh()
@@ -909,13 +929,14 @@ Panel {
       if (exitNodeSwitcher) {
         if (t.exitNode) {
           lines.push({ t: "Stop using " + (t.exitNode.name || "the exit node") + " — internet goes back out locally",
-                       k: "action", id: "exit:off", cmd: ["tailscale", "set", "--exit-node="] })
+                       k: "action", id: "exit:off", target: "off" })
         }
         for (var xp = 0; xp < peers.length; xp++) {
           var xe = peers[xp]
           if (!xe.exitNodeOption || xe.exitNode || !xe.online || !xe.ip) continue
+          if (!exitNodeTarget.test(String(xe.ip))) continue
           lines.push({ t: "Route all internet traffic through " + xe.name,
-                       k: "action", id: "exit:" + xe.ip, cmd: ["tailscale", "set", "--exit-node=" + xe.ip] })
+                       k: "action", id: "exit:" + xe.ip, target: String(xe.ip) })
         }
       }
       if (peers.length) lines.push({ t: "Peers (" + peers.length + "):", k: "head" })
@@ -1141,6 +1162,7 @@ Panel {
             }
             Text {
               visible: root.dnsLeaking
+              textFormat: Text.PlainText
               width: parent.width
               leftPadding: Style.space(52)
               text: "⚠ DNS leaves the tunnel: " + (root.dnsLeak ? root.dnsLeak.detail : "")
@@ -1515,7 +1537,7 @@ Panel {
 
           PanelToolTip {
             visible: actionMouse.containsMouse
-            text: root.plain("Runs: " + (detailLine.modelData.cmd || []).join(" ") + "\nTakes two clicks; nothing else on this machine changes.")
+            text: root.plain("Runs: " + root.actionCommandText(String(detailLine.modelData.target || "")) + "\nTakes two clicks; nothing else on this machine changes.")
             fontFamily: root.fontFamily
           }
         }

@@ -217,11 +217,15 @@ Tailscale setup does not cry wolf.
 
 The Tailscale section lists every peer that offers itself as an exit node.
 Clicking one arms the action and shows the exact command; clicking again runs
-`tailscale set --exit-node=<ip>`. With an exit node active there is also
-*Stop using …*, which runs `tailscale set --exit-node=`. This is the only
+`/usr/bin/tailscale set --exit-node=<ip>`. With an exit node active there is
+also *Stop using …*, which runs `tailscale set --exit-node=`. This is the only
 place where the widget changes the machine instead of describing it, so it
 always takes two clicks, always shows the command first, and never uses root.
-If tailscaled refuses, run `sudo tailscale set --operator=$USER` once. Set
+Under the hood the panel calls `collect.py --exit-node off|<ip>`: the target
+is validated as an address on both sides (a regex in QML, `ipaddress` in
+Python) and `tailscale set` runs through the same fixed-path, clean-environment,
+deadlined and output-capped runner as every read-only query. If tailscaled
+refuses, run `sudo tailscale set --operator=$USER` once. Set
 `exitNodeSwitcher` to `false` to remove these actions entirely.
 
 ## Traffic history
