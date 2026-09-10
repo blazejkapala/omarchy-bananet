@@ -4,8 +4,10 @@
 that shows **where this machine's traffic really exits**: active networks and tunnels (Wi‑Fi, Ethernet,
 Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN), **your
 public IP and who owns it**, live throughput with 24 h charts, routes, DNS,
-and **which services (processes) talk to which addresses over which tunnel**.
-No root required; the widget detects what is installed and only uses that,
+**which services (processes) talk to which addresses over which tunnel**, and
+**alerts** when the egress link, the public address or the listening services
+change, when a captive portal appears or an open Wi‑Fi carries traffic
+untunnelled. No root required; the widget detects what is installed and only uses that,
 degrades gracefully, and tells you what one command would unlock.
 
 <p align="center">
@@ -53,9 +55,10 @@ Colours follow the active Omarchy theme, light or dark:
   resolver, **public IP** (IPv4 / IPv6) with the owning network, city and
   country, warnings. The public address is checked every 5 minutes, when the
   egress route changes, and on manual refresh (`r`); a failed check keeps the
-  last answer marked *stale* instead of pretending. Two warnings live here:
-  **DNS leaving the tunnel** and **the egress link having just changed** (see
-  *Watching for trouble*).
+  last answer marked *stale* instead of pretending. Warnings live here too:
+  **DNS leaving the tunnel**, a **captive portal** or **open Wi‑Fi**, and the
+  **alerts of the last 24 h** (egress link changed, public IP changed, new
+  listening service) with their age — see *Watching for trouble*.
 - *Interfaces & tunnels* — one row per interface: kind, network/tailnet name,
   IP, gateway, Wi‑Fi signal, connection count, a sparkline and live ↓/↑ rates.
   Hover = tooltip with details; click/Enter = expand: **traffic chart over
@@ -69,13 +72,19 @@ Colours follow the active Omarchy theme, light or dark:
     routes, LEAF peers with latency and path (direct / relay),
   - WireGuard: peers, endpoint, allowed IPs, last handshake, bytes,
   - OpenVPN: config name and remote server,
+  - a one-click **ping through this link** (`p` on the row): three echo
+    requests to the far end of the tunnel — the exit node, the active peer, a
+    managed-route gateway, a `/32` allowed IP — or to the gateway, with the
+    reply count and round-trip time shown underneath (see *Is the tunnel
+    actually carrying traffic?*),
   - plus **connections going through this interface grouped by process**.
 - *Services → addresses* — every process with its connection count and split
   per interface (`wlp2s0 ×7 · tailscale0 ×2`). Expanding lists every remote
   address with port, protocol, interface and host name (reverse DNS, cached;
   Tailscale peers get their tailnet name).
 - *Listening services* — ports something listens on and on which addresses
-  (all / localhost only / a specific tunnel).
+  (all / localhost only / a specific tunnel). A service that started listening
+  within the last hour is tagged **new**.
 - *Optional privileges* — cards for permissions that improve the data (see
   below).
 
@@ -91,6 +100,7 @@ Colours follow the active Omarchy theme, light or dark:
 | Chart range 1h / 6h / 24h | `1` / `2` / `3` |
 | Show listening services | `l` or click the header |
 | Copy (interface IP / first remote address / listener address) | `c`, right click on a row |
+| Ping through the selected interface | `p`, or click the *Ping …* line in the expanded row |
 | Close | Esc |
 | Switch to a neighbouring bar panel | Tab / Shift+Tab |
 
@@ -104,7 +114,10 @@ Colours follow the active Omarchy theme, light or dark:
 | `showLabel` | false | `wifi +2` label next to the icon |
 | `showTooltip` | false | summary tooltip on hover |
 | `publicIp` | true | check the public IP and its owner (icanhazip.com + ipinfo.io), see *Privacy* |
-| `notifyEgressChange` | true | desktop notification when the internet starts leaving through a different link |
+| `notifyEgressChange` | true | desktop notification when the internet starts leaving through a different link, a captive portal appears, or an open Wi‑Fi carries traffic untunnelled |
+| `notifyPublicIpChange` | true | desktop notification when the public IP changes although the egress link did not (ISP re-lease, VPN server switch) |
+| `notifyNewListener` | true | desktop notification when a new service starts listening on a non-loopback address (TCP always; UDP only on ports ≤ 1024 or well-known ones, because browsers bind random UDP ports all day) |
+| `tunnelProbe` | true | offer the one-click ping through each link (runs `/usr/bin/ping -c 3`) |
 | `exitNodeSwitcher` | true | offer Tailscale exit-node switching in the panel (two clicks, runs `tailscale set`) |
 | `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-bananet/`) |
 | `useSudo` | true | try `sudo -n` for the five allowlisted read-only commands (`zerotier-cli -j listnetworks`/`listpeers`, `wg show all dump`, `ss -tunpHO`, `ss -tulnpHO`); passwordless only, answer remembered 10 min |
@@ -196,14 +209,41 @@ To undo any of them: `sudo rm -f /etc/sudoers.d/omarchy-bananet-NAME`.
 
 ## Watching for trouble
 
-Two things the widget will tell you about without being asked:
+The collector remembers what it saw last time (`~/.cache/omarchy-bananet/state.json`:
+egress link, public address, listeners, connectivity verdict — no credentials)
+and turns the differences into alerts. Alerts stay in the *Egress* section for
+24 h with their age; new ones become desktop notifications, urgent ones also
+turn the bar icon red for two minutes or until you open the panel. The first
+run on a machine only records and says nothing, and the panel never notifies
+about alerts older than ten minutes (so a restart does not replay yesterday).
 
 **The tunnel dropped.** Every refresh the collector reports which link the
-internet actually leaves through. When that changes, the panel gets a
-*Changed* line ("2 min ago: wg0 (wireguard) → wlp2s0 (wifi)") and a desktop
-notification goes out; falling *out* of a tunnel is sent as urgent and turns
-the bar icon red for two minutes or until you open the panel. Set
-`notifyEgressChange` to `false` for the panel line without the notification.
+internet actually leaves through. When that changes you get "Traffic left the
+tunnel: wg0 (wireguard) → wlp2s0 (wifi)" (urgent), "Traffic now goes through a
+tunnel" or "Egress changed". The panel's *History* line lists the last few
+transitions. Set `notifyEgressChange` to `false` for the panel entries without
+the notification.
+
+**The public IP changed** without the egress link changing: the ISP handed out
+a new lease, the VPN provider moved you to another server, a captive portal
+took over. Reported as "Public IP changed: a.b.c.d → e.f.g.h · owner". A new
+address in the two minutes after an egress change is the same event and is
+not reported twice. Setting: `notifyPublicIpChange`.
+
+**Something new is listening.** A service that starts accepting connections on
+a non-loopback address ("New listening service: tcp 0.0.0.0:2222 (sshd)") is
+reported once and tagged *new* in the listener list for an hour. TCP listeners
+always count; UDP only on ports ≤ 1024 or well-known ones, otherwise browsers
+and media apps would alert all day. A listener that disappears for a week and
+comes back is new again. Setting: `notifyNewListener`.
+
+**Captive portal.** NetworkManager's connectivity check is shown on a *Check*
+line when it is anything but *full*; *portal* (a hotel or airport network
+intercepting web traffic until you sign in) is reported as urgent.
+
+**Open Wi‑Fi without a tunnel.** When the internet leaves through a Wi‑Fi
+network with no encryption and no tunnel or exit node in front of it, the
+panel says so in red and you get one urgent notification per network.
 
 **DNS is leaking out of the tunnel.** Traffic can go through WireGuard or a
 Tailscale exit node while name lookups still go to the router on the local
@@ -212,6 +252,23 @@ up. When the default route is a tunnel but the resolver is not on it, the DNS
 line turns red and says exactly which resolver on which interface is answering.
 MagicDNS (`100.100.100.100`) counts as being on the tunnel, so a normal
 Tailscale setup does not cry wolf.
+
+## Is the tunnel actually carrying traffic?
+
+An interface being *up* with an address says nothing about whether the other
+end answers — a WireGuard tunnel to a router that rebooted looks exactly like a
+working one until a handshake fails. Every active interface therefore offers a
+*Ping … through …* line in its expanded row (or `p` on the row): the panel
+runs `collect.py --probe <dev> <ip>`, which sends three ICMP echo requests
+bound to that interface (`/usr/bin/ping -c 3 -W 1 -I <dev> <ip>`, no root
+needed on a normal system) and shows the reply count and average / maximum
+round-trip time underneath. The target is picked automatically: the Tailscale
+exit node or the active peer, a ZeroTier managed-route gateway, a WireGuard
+route gateway or a `/32` allowed IP, otherwise the link's gateway. Both
+arguments are validated on both sides (an interface-name pattern and
+`ipaddress` in Python) and ping runs through the same fixed-path,
+clean-environment, deadlined and output-capped runner as every query. Set
+`tunnelProbe` to `false` to remove the lines.
 
 ## Switching the Tailscale exit node
 
@@ -252,8 +309,12 @@ through.
   `tailscale status --json`, `zerotier-cli -j`, `wg show all dump`, `ss -tunp`.
   Every child runs with a clean environment, a deadline and a byte ceiling;
   the JSON it prints is bounded in size. Run it by hand:
-  `python3 -I collect.py --history | jq .` — and `python3 -I collect.py --setup NAME`
-  installs an optional sudoers rule (see *Privileges*).
+  `python3 -I collect.py --history | jq .` — `python3 -I collect.py --setup NAME`
+  installs an optional sudoers rule (see *Privileges*), `--probe DEV IP` pings
+  through an interface, `--exit-node off|IP` switches the Tailscale exit node.
+- `~/.cache/omarchy-bananet/` (private, `0700`): `history.jsonl` (24 h of
+  counters), `state.json` (what was seen last time, for the alerts),
+  `public.json`, `rdns.json`, `sudo.json`. Delete any of them to reset.
 
 ## Manage
 
@@ -284,6 +345,9 @@ Everything runs locally except two optional lookups:
   is dropped, and the body is read through a 64 KB cap before it is parsed.
 - **Reverse DNS** for remote addresses (`resolveNames`), which goes through
   your normal resolver.
+
+The ping check (`tunnelProbe`) only ever sends packets to an address that is
+already in your routing table or tunnel configuration, and only when you click.
 
 The screenshots above were taken in demo mode with synthetic data.
 

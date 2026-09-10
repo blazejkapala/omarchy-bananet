@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "banan.bananet",
   "name": "Bananet",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "banan",
   "license": "MIT",
-  "description": "Bananet — where does your traffic go? Networks, tunnels, egress route and per-service connections in the Omarchy bar: Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN, public IP and its owner, live throughput with 24 h charts, routes, DNS, and which services talk to which addresses over which link.",
+  "description": "Bananet — where does your traffic go? Networks, tunnels, egress route and per-service connections in the Omarchy bar: Wi-Fi, Ethernet, Tailscale, ZeroTier, WireGuard / MikroTik Back To Home, OpenVPN, public IP and its owner, live throughput with 24 h charts, routes, DNS, which services talk to which addresses over which link, and alerts when the egress link, the public IP or the listening services change.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Bananet",
-    "description": "Networks, tunnels, egress and per-service connections with 24 h charts, DNS-leak warning and egress-change alerts. Click for the panel.",
+    "description": "Networks, tunnels, egress and per-service connections with 24 h charts, DNS-leak warning, egress / public IP / new-listener alerts, captive-portal and open-Wi-Fi warnings and a ping-through-link check. Click for the panel.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -32,7 +32,10 @@
       "showVirtual": false,
       "publicIp": true,
       "notifyEgressChange": true,
-      "exitNodeSwitcher": true
+      "exitNodeSwitcher": true,
+      "notifyPublicIpChange": true,
+      "notifyNewListener": true,
+      "tunnelProbe": true
     },
     "schema": [
       {
@@ -80,7 +83,25 @@
       {
         "key": "notifyEgressChange",
         "type": "boolean",
-        "label": "Notify when the internet starts leaving through a different link (e.g. a tunnel drops)",
+        "label": "Notify when the internet starts leaving through a different link (a tunnel drops), a captive portal appears or an open Wi-Fi carries traffic untunnelled",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyPublicIpChange",
+        "type": "boolean",
+        "label": "Notify when the public IP changes without the egress link changing (ISP re-lease, VPN server switch)",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyNewListener",
+        "type": "boolean",
+        "label": "Notify when a new service starts listening on a non-loopback address (TCP, or UDP on well-known ports)",
+        "defaultValue": true
+      },
+      {
+        "key": "tunnelProbe",
+        "type": "boolean",
+        "label": "Offer a one-click ping through each link (three echo requests to the tunnel's far end or the gateway)",
         "defaultValue": true
       },
       {

@@ -27,9 +27,13 @@ Boundaries, so the reader does not have to hunt for them:
     validated with visudo and published atomically by ROOT_INSTALLER, a root-side
     Python program passed to `sudo python3 -I -` on stdin, so root never opens a
     file from this (user-writable) directory
-  * `--exit-node off|IP` is the one action the panel can trigger: the target is
-    parsed with ipaddress (or is the literal `off`) and `tailscale set` runs through
-    the same bounded run() as every query - no root involved
+  * `--exit-node off|IP` and `--probe DEV IP` are the two actions the panel can
+    trigger: the targets are parsed with ipaddress (or are the literal `off` / an
+    interface name matching [A-Za-z0-9_.-]{1,15}) and `tailscale set` / `ping`
+    run through the same bounded run() as every query - no root involved
+  * `state.json` in the cache directory remembers what was seen last time (egress
+    link, public address, listeners, connectivity) so that changes can be reported;
+    it holds no credentials, and a broken or missing file only means "no history"
   * the JSON document is bounded (string lengths and list sizes) before it is printed
 """
 import http.client
@@ -55,6 +59,14 @@ RDNS_CACHE = os.path.join(CACHE_DIR, "rdns.json")
 SUDO_CACHE = os.path.join(CACHE_DIR, "sudo.json")
 HISTORY_FILE = os.path.join(CACHE_DIR, "history.jsonl")
 PUBLIC_CACHE = os.path.join(CACHE_DIR, "public.json")
+STATE_FILE = os.path.join(CACHE_DIR, "state.json")
+ALERT_KEEP = 24 * 3600          # how long an alert stays in the panel
+ALERT_MAX = 50
+EGRESS_LOG_KEEP = 7 * 24 * 3600 # egress-change log retention
+EGRESS_LOG_MAX = 200
+LISTENER_FORGET = 7 * 24 * 3600 # a listener not seen for this long is "new" again when it returns
+LISTENER_NEW_FOR = 3600         # how long a listener is flagged as new in the panel
+QUIET_AFTER_EGRESS = 120        # a public-IP change this soon after an egress change is the same event
 PUBLIC_TTL = 300           # seconds between public-IP checks (also re-checked when the egress route changes)
 HISTORY_STEP = 30          # seconds between stored samples
 HISTORY_KEEP = 24 * 3600   # seconds of history to keep
@@ -104,6 +116,7 @@ BIN = {
     "zerotier-cli": "/usr/bin/zerotier-cli",
     "wg": "/usr/bin/wg",
     "openvpn": "/usr/bin/openvpn",
+    "ping": "/usr/bin/ping",
     "sudo": "/usr/bin/sudo",
     "python3": "/usr/bin/python3",
 }
@@ -386,6 +399,60 @@ def cmd_exit_node(target):
     if err:
         sys.stderr.write(err[:4096])
     return rc if rc >= 0 else 1
+
+
+PROBE_TIMEOUT = 8.0
+PROBE_COUNT = 3
+IFNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+
+
+def cmd_probe(dev, target):
+    """`collect.py --probe DEV IP`: is the far side of a tunnel actually answering?
+
+    Sends PROBE_COUNT ICMP echo requests to IP bound to interface DEV and prints
+    one JSON line with the reply count and round-trip times. Nothing on the machine
+    changes. DEV must look like an interface name and IP must parse with ipaddress;
+    ping runs through run() (fixed path, clean environment, deadline, capped pipes)
+    and needs no root on a normal system (net.ipv4.ping_group_range)."""
+    dev = str(dev or "")
+    target = str(target or "")
+    if not IFNAME_RE.match(dev) or dev in (".", ".."):
+        sys.stderr.write("usage: collect.py --probe DEV IP\n")
+        return 2
+    if len(target) > 45:
+        sys.stderr.write("refusing: probe target too long\n")
+        return 2
+    try:
+        addr = ipaddress.ip_address(target)
+    except ValueError:
+        sys.stderr.write("usage: collect.py --probe DEV IP\n")
+        return 2
+    why = trusted_binary(BIN["ping"])
+    if why:
+        sys.stderr.write("refusing: %s\n" % why)
+        return 1
+    cmd = [BIN["ping"], "-6" if addr.version == 6 else "-4", "-n", "-q",
+           "-c", str(PROBE_COUNT), "-W", "1", "-i", "0.3", "-I", dev, "--", str(addr)]
+    started = time.time()
+    rc, out, err = run(cmd, timeout=PROBE_TIMEOUT, max_bytes=64 * 1024)
+    result = {"ok": False, "dev": dev, "target": str(addr), "sent": PROBE_COUNT, "received": 0,
+              "avgMs": None, "maxMs": None, "tookMs": int((time.time() - started) * 1000), "error": ""}
+    m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", out)
+    if m:
+        result["sent"], result["received"] = int(m.group(1)), int(m.group(2))
+    m = re.search(r"= ([0-9.]+)/([0-9.]+)/([0-9.]+)/", out)
+    if m:
+        result["avgMs"] = round(float(m.group(2)), 1)
+        result["maxMs"] = round(float(m.group(3)), 1)
+    result["ok"] = result["received"] > 0
+    if rc < 0:
+        result["error"] = "timed out"
+    elif not result["ok"]:
+        last = [ln for ln in (err or "").splitlines() if ln.strip()]
+        result["error"] = clip(last[-1] if last else ("no reply" if rc in (0, 1) else "ping exited %d" % rc), 160)
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
 
 
 # --------------------------------------------------------------------------- helpers
@@ -698,15 +765,27 @@ def nm_active_connections():
 
 
 def nm_wifi_active():
-    rc, out, _ = run([BIN["nmcli"], "-t", "-f", "ACTIVE,SSID,SIGNAL,FREQ,RATE", "dev", "wifi", "list", "--rescan", "no"])
+    rc, out, _ = run([BIN["nmcli"], "-t", "-f", "ACTIVE,SSID,SIGNAL,FREQ,RATE,SECURITY", "dev", "wifi", "list", "--rescan", "no"])
     if rc != 0:
         return None
     for line in out.splitlines():
         parts = line.split(":")
-        if len(parts) < 5 or parts[0] != "yes":
+        if len(parts) < 6 or parts[0] != "yes":
             continue
-        return {"ssid": ":".join(parts[1:-3]), "signal": int(parts[-3] or 0), "freq": parts[-2], "rate": parts[-1]}
+        security = parts[-1].strip()
+        if security in ("--", "(none)"):
+            security = ""
+        return {"ssid": ":".join(parts[1:-4]), "signal": int(parts[-4] or 0), "freq": parts[-3], "rate": parts[-2],
+                "security": security, "open": security == ""}
     return None
+
+
+def nm_connectivity():
+    """NetworkManager's own verdict on the internet: full, limited, portal (a
+    captive portal is intercepting HTTP), none or unknown."""
+    rc, out, _ = run([BIN["nmcli"], "-t", "-f", "CONNECTIVITY", "general"])
+    value = out.strip().split("\n")[0].strip() if rc == 0 else ""
+    return value if value in ("full", "limited", "portal", "none") else "unknown"
 
 
 def nm_connection_fields(name):
@@ -1392,6 +1471,163 @@ def record_history(counters, now):
     return out
 
 
+# --------------------------------------------------------------------------- state & alerts
+
+def alertable_listener(l):
+    """Which listeners are worth an alert when they appear. TCP on a non-loopback
+    address always; UDP only on privileged or well-known ports, because browsers
+    and media apps bind random UDP ports all day (WebRTC, QUIC, mDNS helpers)."""
+    if l.get("scope") == "lo":
+        return False
+    if l.get("proto", "").startswith("tcp"):
+        return True
+    port = int(l.get("port") or 0)
+    return port <= 1024 or port in WELL_KNOWN_PORTS
+
+
+def listener_key(l):
+    return "%s:%s:%s" % (l.get("proto", ""), l.get("addr", ""), l.get("port", ""))
+
+
+def update_state(now, egress_fp, public, listeners, connectivity, wifi, egress_kind, exit_node):
+    """Compare this run with the last one and turn the differences into alerts.
+
+    state.json keeps: the egress-change log, the last public address, every
+    non-loopback listener with first/last-seen times, the last connectivity
+    verdict, and the alerts of the last 24 h. Returns (egress_log, alerts,
+    listener_first_seen). The first run on a machine records and says nothing:
+    there is nothing to compare with yet."""
+    state = load_json_file(STATE_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    changed = False
+    new_alerts = []
+
+    def alert(kind, title, body, urgent=False, **extra):
+        a = {"id": "%s:%d" % (kind, int(now * 1000)), "kind": kind, "at": round(now, 1), "urgent": bool(urgent),
+             "title": clip(title, 120), "body": clip(body, 300)}
+        a.update(extra)
+        new_alerts.append(a)
+
+    def tunnelled(fp):
+        return bool(fp.get("exitNode")) or fp.get("kind") in TUNNEL_KINDS
+
+    def label(fp):
+        if not fp.get("dev"):
+            return "no route"
+        return fp["dev"] + (" (%s)" % fp["kind"] if fp.get("kind") else "") + (" via exit node " + fp["exitNode"] if fp.get("exitNode") else "")
+
+    # --- egress log
+    log = [e for e in state.get("egress", []) if isinstance(e, dict)]
+    log = [e for e in log if now - float(e.get("at", 0) or 0) < EGRESS_LOG_KEEP][-EGRESS_LOG_MAX:]
+    fp = {"dev": egress_fp.get("dev", ""), "kind": egress_fp.get("kind", ""), "exitNode": egress_fp.get("exitNode", ""), "gateway": egress_fp.get("gateway", "")}
+    key = "%s|%s|%s" % (fp["dev"], fp["kind"], fp["exitNode"])
+    last = log[-1] if log else None
+    last_key = "%s|%s|%s" % (last.get("dev", ""), last.get("kind", ""), last.get("exitNode", "")) if last else None
+    egress_changed_at = 0.0
+    if last_key != key:
+        entry = dict(fp, at=round(now, 1))
+        log.append(entry)
+        changed = True
+        if last is not None:
+            lost = tunnelled(last) and not tunnelled(fp)
+            gained = not tunnelled(last) and tunnelled(fp)
+            egress_changed_at = now
+            alert("egress",
+                  "Traffic left the tunnel" if lost else ("Traffic now goes through a tunnel" if gained else "Egress changed"),
+                  label(last) + "  →  " + label(fp), urgent=lost, lost=lost)
+    elif last is not None:
+        egress_changed_at = float(last.get("at", 0) or 0)
+    if log != state.get("egress"):
+        state["egress"] = log
+        changed = True
+
+    # --- public address
+    pub_now = {"v4": (public or {}).get("v4") or "", "v6": (public or {}).get("v6") or ""} if public and public.get("available") and not public.get("stale") else None
+    pub_last = state.get("public") if isinstance(state.get("public"), dict) else None
+    if pub_now is not None:
+        if pub_last and (pub_last.get("v4") or pub_last.get("v6")) and (pub_last.get("v4"), pub_last.get("v6")) != (pub_now["v4"], pub_now["v6"]):
+            who = ((public or {}).get("info") or {}).get("org", "")
+            body = "%s  →  %s" % (pub_last.get("v4") or pub_last.get("v6"), pub_now["v4"] or pub_now["v6"]) + ("  ·  " + who if who else "")
+            # Right after the egress moved, a new public address is the same story - the egress alert tells it.
+            if now - egress_changed_at > QUIET_AFTER_EGRESS:
+                alert("public", "Public IP changed", body)
+            state["publicPrev"] = dict(pub_last, until=round(now, 1))
+        if not pub_last or (pub_last.get("v4"), pub_last.get("v6")) != (pub_now["v4"], pub_now["v6"]):
+            state["public"] = dict(pub_now, at=round(now, 1))
+            changed = True
+
+    # --- listeners
+    known = state.get("listeners") if isinstance(state.get("listeners"), dict) else None
+    first_run = known is None
+    known = dict(known or {})
+    seen_now = set()
+    first_seen = {}
+    fresh = []
+    for l in listeners:
+        if l.get("scope") == "lo":
+            continue
+        k = listener_key(l)
+        seen_now.add(k)
+        old = known.get(k)
+        if isinstance(old, list) and len(old) == 2 and now - float(old[1] or 0) < LISTENER_FORGET:
+            known[k] = [old[0], round(now, 1)]
+        else:
+            known[k] = [round(now, 1), round(now, 1)]
+            if not first_run and alertable_listener(l):
+                fresh.append(l)
+            changed = True
+        first_seen[k] = known[k][0]
+    for k in list(known.keys()):
+        if k not in seen_now and now - float((known[k] or [0, 0])[1] or 0) > LISTENER_FORGET:
+            del known[k]
+            changed = True
+    if len(known) > 1000:
+        for k in sorted(known, key=lambda kk: known[kk][1])[: len(known) - 1000]:
+            del known[k]
+        changed = True
+    if known != state.get("listeners"):
+        state["listeners"] = known
+        changed = True
+    if fresh:
+        fresh.sort(key=lambda l: (l.get("proto", ""), int(l.get("port") or 0)))
+        parts = ["%s %s:%s (%s)" % (l.get("proto"), l.get("addr"), l.get("port"), l.get("proc") or "?") for l in fresh[:6]]
+        more = len(fresh) - 6
+        alert("listener", "New listening service" if len(fresh) == 1 else "%d new listening services" % len(fresh),
+              ", ".join(parts) + (", … +%d" % more if more > 0 else ""), urgent=False,
+              listeners=[listener_key(l) for l in fresh[:20]])
+
+    # --- connectivity (captive portal)
+    last_conn = state.get("connectivity", "")
+    if connectivity != last_conn:
+        state["connectivity"] = connectivity
+        changed = True
+        if connectivity == "portal":
+            alert("portal", "Captive portal", "This network intercepts web traffic until you sign in; nothing you send is private yet", urgent=True)
+
+    # --- open Wi-Fi without a tunnel
+    open_wifi = bool(wifi and wifi.get("open") and egress_kind == "wifi" and not exit_node)
+    ssid = (wifi or {}).get("ssid", "") if open_wifi else ""
+    if open_wifi and state.get("openWifi") != ssid:
+        state["openWifi"] = ssid
+        changed = True
+        alert("openwifi", "Open Wi-Fi without a tunnel", "\"%s\" has no encryption and your traffic leaves through it directly" % ssid, urgent=True)
+    elif not open_wifi and state.get("openWifi"):
+        state["openWifi"] = ""
+        changed = True
+
+    # --- alerts ring
+    alerts = [a for a in state.get("alerts", []) if isinstance(a, dict) and now - float(a.get("at", 0) or 0) < ALERT_KEEP]
+    if new_alerts or len(alerts) != len(state.get("alerts", [])):
+        alerts = (alerts + new_alerts)[-ALERT_MAX:]
+        state["alerts"] = alerts
+        changed = True
+
+    if changed:
+        save_json_file(STATE_FILE, state)
+    return log[-30:], alerts, first_seen, open_wifi
+
+
 # --------------------------------------------------------------------------- demo
 
 def demo_output(now):
@@ -1484,20 +1720,33 @@ def demo_output(now):
         process_list.append(pr)
     process_list.sort(key=lambda p: -p["count"])
     listeners = [
-        {"proto": "tcp", "port": 22, "addr": "0.0.0.0", "scope": "all", "proc": "sshd", "pid": 812, "guessed": False},
+        {"proto": "tcp", "port": 22, "addr": "0.0.0.0", "scope": "all", "proc": "sshd", "pid": 812, "guessed": False, "firstSeen": now - 86400 * 30},
         {"proto": "tcp", "port": 8384, "addr": "127.0.0.1", "scope": "lo", "proc": "syncthing", "pid": 1043, "guessed": False},
         {"proto": "tcp", "port": 22000, "addr": "0.0.0.0", "scope": "all", "proc": "syncthing", "pid": 1043, "guessed": False},
         {"proto": "udp", "port": 41641, "addr": "0.0.0.0", "scope": "all", "proc": "tailscaled", "pid": 900, "guessed": False},
         {"proto": "udp", "port": 9993, "addr": "0.0.0.0", "scope": "all", "proc": "zerotier-one", "pid": 910, "guessed": False},
-        {"proto": "tcp", "port": 5900, "addr": "100.101.1.5", "scope": "tailscale0", "proc": "wayvnc", "pid": 2210, "guessed": False},
+        {"proto": "tcp", "port": 5900, "addr": "100.101.1.5", "scope": "tailscale0", "proc": "wayvnc", "pid": 2210, "guessed": False, "firstSeen": now - 620},
+    ]
+    for l in listeners:
+        l.setdefault("firstSeen", now - 86400 * 12)
+    egress_log = [
+        {"at": now - 86400 * 3, "dev": "wlp2s0", "kind": "wifi", "exitNode": "", "gateway": "192.168.1.1"},
+        {"at": now - 7200 - 300, "dev": "wg0", "kind": "wireguard", "exitNode": "", "gateway": ""},
+        {"at": now - 7200, "dev": "wlp2s0", "kind": "wifi", "exitNode": "", "gateway": "192.168.1.1"},
+    ]
+    alerts = [
+        {"id": "egress:1", "kind": "egress", "at": now - 7200, "urgent": True, "lost": True, "title": "Traffic left the tunnel", "body": "wg0 (wireguard)  →  wlp2s0 (wifi)"},
+        {"id": "listener:1", "kind": "listener", "at": now - 620, "urgent": False, "title": "New listening service", "body": "tcp 100.101.1.5:5900 (wayvnc)", "listeners": ["tcp:100.101.1.5:5900"]},
     ]
     return {
         "ts": now, "tookMs": 41, "privilegedSockets": True, "demo": True,
         "egress": {"v4": {"dst": "1.1.1.1", "dev": "wlp2s0", "gateway": "192.168.1.1", "src": "192.168.1.42", "table": "main"}, "v6": None, "exitNode": None, "dnsDev": "wlp2s0", "dns": ["192.168.1.1"],
+                   "connectivity": "full", "openWifi": False,
                    "dnsLeak": compute_dns_leak("wlp2s0", {"wlp2s0": "wifi", "tailscale0": "tailscale", "wg0": "wireguard", "ztklhxtbsb": "zerotier"}, "wlp2s0", ["192.168.1.1"], None)},
         "interfaces": interfaces, "tunnelsActive": 3, "connections": connections, "otherStates": 2, "processes": process_list,
         "listeners": listeners, "rules": [], "tailscale": tailscale, "zerotier": {"installed": True, "available": True, "networks": [zt_net], "peers": zt_peers, "rootCount": 4, "rootsDirect": 3},
         "warnings": [], "setup": [], "history": history if OPTS["history"] else None, "historyStep": HISTORY_STEP,
+        "egressLog": egress_log, "alerts": alerts,
         "tools": [{"name": n, "label": l, "found": n not in ("openvpn",)} for n, l in TOOLS],
         "public": {"available": True, "stale": False, "v4": "203.0.113.42", "v6": None, "checkedAt": now - 95,
                    "via": {"dev": "wlp2s0", "gateway": "192.168.1.1", "src": "192.168.1.42", "exitNode": ""},
@@ -1513,6 +1762,8 @@ def main():
         sys.exit(cmd_setup(args[1] if len(args) > 1 else ""))
     if args and args[0] == "--exit-node":
         sys.exit(cmd_exit_node(args[1] if len(args) > 1 else ""))
+    if args and args[0] == "--probe":
+        sys.exit(cmd_probe(args[1] if len(args) > 1 else "", args[2] if len(args) > 2 else ""))
     i = 0
     while i < len(args):
         a = args[i]
@@ -1555,6 +1806,7 @@ def main():
     nm_devs = nm_devices()
     active_conns = nm_active_connections()
     wifi = nm_wifi_active()
+    connectivity = nm_connectivity()
     routes = collect_routes()
     rules = collect_rules()
     dns_servers, dns_domains, dns_default = collect_dns()
@@ -1773,6 +2025,20 @@ def main():
     egress_dev = (egress4 or {}).get("dev", "") or (egress6 or {}).get("dev", "")
     dns_leak = compute_dns_leak(egress_dev, {i["name"]: i["kind"] for i in interfaces},
                                 default_dns_dev, default_dns, (tailscale or {}).get("exitNode"))
+    listeners_out = sorted(
+        [{"proto": l["proto"], "port": l["lport"], "addr": l["lip"], "scope": l["scope"], "proc": l["proc"], "pid": l["pid"], "guessed": bool(l.get("guessed"))} for l in listeners],
+        key=lambda l: (l["scope"] == "lo", l["port"], l["proto"]),
+    )
+    public = collect_public(egress4, egress6, (tailscale or {}).get("exitNode"))
+    exit_node = (tailscale or {}).get("exitNode")
+    kinds = {i["name"]: i["kind"] for i in interfaces}
+    egress_fp = {"dev": egress_dev, "kind": kinds.get(egress_dev, ""),
+                 "exitNode": (exit_node.get("name") or ",".join(exit_node.get("ips") or [])) if exit_node else "",
+                 "gateway": (egress4 or {}).get("gateway", "") or (egress6 or {}).get("gateway", "")}
+    egress_log, alerts, listener_first_seen, open_wifi = update_state(
+        time.time(), egress_fp, public, listeners_out, connectivity, wifi, kinds.get(egress_dev, ""), exit_node)
+    for l in listeners_out:
+        l["firstSeen"] = listener_first_seen.get(listener_key(l))
     output = {
         "ts": time.time(),
         "tookMs": int((time.time() - started) * 1000),
@@ -1780,10 +2046,12 @@ def main():
         "egress": {
             "v4": egress4,
             "v6": egress6,
-            "exitNode": (tailscale or {}).get("exitNode"),
+            "exitNode": exit_node,
             "dnsDev": default_dns_dev,
             "dns": default_dns,
             "dnsLeak": dns_leak,
+            "connectivity": connectivity,
+            "openWifi": open_wifi,
         },
         "interfaces": interfaces,
         "tunnelsActive": sum(1 for i in interfaces if i["active"] and i["kind"] in ("tailscale", "zerotier", "wireguard", "openvpn", "vpn")),
@@ -1793,17 +2061,16 @@ def main():
         ],
         "otherStates": len(conns) - len(live),
         "processes": process_list,
-        "listeners": sorted(
-            [{"proto": l["proto"], "port": l["lport"], "addr": l["lip"], "scope": l["scope"], "proc": l["proc"], "pid": l["pid"], "guessed": bool(l.get("guessed"))} for l in listeners],
-            key=lambda l: (l["scope"] == "lo", l["port"], l["proto"]),
-        ),
+        "listeners": listeners_out,
         "rules": rules,
         "tailscale": tailscale,
         "zerotier": zerotier,
         "warnings": WARNINGS,
         "setup": SETUP,
         "tools": collect_tools(),
-        "public": collect_public(egress4, egress6, (tailscale or {}).get("exitNode")),
+        "public": public,
+        "egressLog": egress_log,
+        "alerts": alerts,
         "history": history,
         "historyStep": HISTORY_STEP,
     }

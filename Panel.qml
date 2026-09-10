@@ -76,7 +76,10 @@ Panel {
   readonly property bool showLoopback: boolSetting("showLoopback", false)
   readonly property bool publicIp: boolSetting("publicIp", true)
   readonly property bool notifyEgress: boolSetting("notifyEgressChange", true)
+  readonly property bool notifyPublicIp: boolSetting("notifyPublicIpChange", true)
+  readonly property bool notifyListeners: boolSetting("notifyNewListener", true)
   readonly property bool exitNodeSwitcher: boolSetting("exitNodeSwitcher", true)
+  readonly property bool tunnelProbe: boolSetting("tunnelProbe", true)
   property bool forcePublic: false     // next refresh re-checks the public IP now (manual refresh)
   readonly property var labelOverrides: {
     var v = setting("labels", null)
@@ -93,9 +96,9 @@ Panel {
   property var rates: ({})
   property var _prev: null
   property string actionStatus: ""
-  property var _egressFrom: null      // last seen egress fingerprint, for change detection
-  property var lastEgressChange: null // { from, to, at } of the most recent change
-  property bool egressAlert: false    // traffic just fell out of a tunnel: bar icon goes urgent
+  property var _seenAlerts: null      // alert ids already handled; null until the first sample
+  property bool egressAlert: false    // an urgent alert just arrived: bar icon goes urgent for a while
+  property var probeResults: ({})     // dev -> { running, ok, sent, received, avgMs, maxMs, target, error, at }
   property string pendingActionId: "" // an action armed by one click, waiting for the second
   property var history: []            // [[ts, {dev: [rx, tx]}], ...] cumulative counters, 30 s apart, 24 h
   property int chartRange: 3600       // seconds shown in charts: 3600 / 21600 / 86400
@@ -111,6 +114,35 @@ Panel {
   readonly property var dnsLeak: egress.dnsLeak || null
   readonly property bool dnsLeaking: !!(dnsLeak && dnsLeak.leaking)
   readonly property var tools: snap && snap.tools ? snap.tools : []
+  readonly property var alerts: snap && snap.alerts ? snap.alerts : []
+  readonly property var egressLog: snap && snap.egressLog ? snap.egressLog : []
+  readonly property string connectivity: egress.connectivity ? String(egress.connectivity) : ""
+  readonly property bool openWifi: !!egress.openWifi
+  // Newest first, at most six; the collector already keeps only the last 24 h.
+  readonly property string alertsJson: {
+    var out = []
+    for (var i = alerts.length - 1; i >= 0 && out.length < 6; i--) out.push(alerts[i])
+    return JSON.stringify(out)
+  }
+  readonly property var latestAlert: alerts.length ? alerts[alerts.length - 1] : null
+  function egressEntryLabel(e) {
+    if (!e || !e.dev) return "no route"
+    return e.dev + (e.exitNode ? " via exit node " + e.exitNode : "")
+  }
+  // The last few egress transitions, newest first: "07:12 wg0 → wlp2s0".
+  readonly property string egressHistoryText: {
+    var parts = []
+    for (var i = egressLog.length - 1; i >= 1 && parts.length < 4; i--) {
+      parts.push(fmtClock(Number(egressLog[i].at || 0)) + " " + egressEntryLabel(egressLog[i - 1]) + " → " + egressEntryLabel(egressLog[i]))
+    }
+    return parts.join("   ·   ")
+  }
+  readonly property string connectivityText: {
+    if (connectivity === "portal") return "captive portal — this network intercepts web traffic until you sign in"
+    if (connectivity === "limited") return "limited — NetworkManager cannot reach the internet through it"
+    if (connectivity === "none") return "no connectivity reported by NetworkManager"
+    return ""
+  }
   readonly property string publicText: {
     if (!pub) return ""
     if (!pub.available) return pub.error ? "unreachable (" + pub.error + ")" : (pub.reason || "unknown")
@@ -193,50 +225,52 @@ Panel {
     lastSampleMs = Date.now()
     lastError = doc.error ? String(doc.error) : ""
     if (doc.history && doc.history.length !== undefined) history = doc.history
-    noteEgressChange(doc)
+    noteAlerts(doc)
     syncRows()
     if (_restoringScroll) Qt.callLater(restoreScroll)
   }
 
-  // Which link does the internet leave through right now? Compared between
-  // samples so a tunnel dropping out is noticed the moment it happens, not
-  // whenever the user next opens the panel.
-  function egressFingerprint(doc) {
-    var e = (doc && doc.egress) || {}
-    var dev = (e.v4 && e.v4.dev) || (e.v6 && e.v6.dev) || ""
-    var kind = ""
-    var list = (doc && doc.interfaces) || []
-    for (var i = 0; i < list.length; i++) if (list[i].name === dev) { kind = list[i].kind; break }
-    var exitNode = e.exitNode ? (e.exitNode.name || (e.exitNode.ips || []).join(",")) : ""
-    return { key: dev + "|" + kind + "|" + exitNode, dev: dev, kind: kind, exitNode: exitNode }
+  // The collector compares each run with the previous one (egress link, public
+  // address, listeners, captive portal, open Wi-Fi) and keeps the resulting
+  // alerts for 24 h in its state file. The panel shows them and turns the new
+  // ones into desktop notifications - so a tunnel dropping out is noticed the
+  // moment it happens, not whenever the user next opens the panel.
+  function alertEnabled(kind) {
+    if (kind === "public") return notifyPublicIp
+    if (kind === "listener") return notifyListeners
+    return notifyEgress   // egress, portal, openwifi: all "where does my traffic go" events
   }
 
-  function egressLabelOf(f) {
-    if (!f || !f.dev) return "no route"
-    return f.dev + (f.kind ? " (" + f.kind + ")" : "") + (f.exitNode ? " via exit node " + f.exitNode : "")
-  }
-
-  function tunnelled(f) { return !!f && (isTunnelKind(f.kind) || !!f.exitNode) }
-
-  function noteEgressChange(doc) {
-    var now = egressFingerprint(doc)
-    now.demo = !!doc.demo
-    if (!_egressFrom) { _egressFrom = now; return }   // first sample: nothing to compare with
-    if (now.key === _egressFrom.key) return
-    var prev = _egressFrom
-    _egressFrom = now
-    // Demo mode invents its own network. Switching into or out of it is not
-    // something that happened to this machine, so it never alerts.
-    if (prev.demo || now.demo) { lastEgressChange = null; return }
-    lastEgressChange = { from: prev, to: now, at: Date.now() / 1000 }
-    var lost = tunnelled(prev) && !tunnelled(now)
-    if (lost) { egressAlert = true; egressAlertTimer.restart() }
-    if (notifyEgress) {
+  function noteAlerts(doc) {
+    var list = doc.alerts || []
+    var first = _seenAlerts === null
+    var seen = first ? {} : _seenAlerts
+    var next = {}
+    var now = Date.now() / 1000
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i]
+      var id = String(a.id || "")
+      next[id] = true
+      // First sample after a (re)start and demo mode: show, never notify.
+      if (first || seen[id] || doc.demo) continue
+      if (now - Number(a.at || 0) > 600) continue
+      if (a.urgent) { egressAlert = true; egressAlertTimer.restart() }
+      if (!alertEnabled(String(a.kind || ""))) continue
       Quickshell.execDetached([notifyBin, "-a", "Bananet",
-                              "-u", lost ? "critical" : "normal",
-                              lost ? "Bananet: traffic left the tunnel" : "Bananet: egress changed",
-                              plain(egressLabelOf(prev) + "  →  " + egressLabelOf(now))])
+                              "-u", a.urgent ? "critical" : "normal",
+                              plain("Bananet: " + a.title),
+                              plain(a.body)])
     }
+    _seenAlerts = next
+  }
+
+  function alertText(a) {
+    if (!a) return ""
+    var age = fmtAge(Math.max(0, Math.round(Date.now() / 1000 - Number(a.at || 0) + 0 * clockTick)))
+    return age + " ago:  " + a.title + (a.body ? " — " + a.body : "")
+  }
+  function alertUrgent(a) {
+    return !!(a && a.urgent && Date.now() / 1000 - Number(a.at || 0) < 3600)
   }
 
   function handleOutput(text) {
@@ -350,7 +384,7 @@ Panel {
     id: actionStatusTimer
     interval: 2200
     repeat: false
-    onTriggered: root.actionStatus = ""
+    onTriggered: { root.actionStatus = ""; interval = 2200 }
   }
 
   // Tick once a second so the "refreshed N s ago" footer stays honest.
@@ -481,6 +515,7 @@ Panel {
       lines.push(line)
     }
     if (egress.dns && egress.dns.length > 0) lines.push("DNS: " + egress.dns.join(", ") + (egress.dnsDev ? " (" + egress.dnsDev + ")" : ""))
+    if (latestAlert && Date.now() / 1000 - Number(latestAlert.at || 0) < 3600) lines.push("⚠ " + alertText(latestAlert))
     for (var m = 0; m < majorSetupItems.length; m++) lines.push("⚠ " + majorSetupItems[m].title + " (open the panel)")
     var procs = snap.processes || []
     if (procs.length > 0) {
@@ -584,6 +619,17 @@ Panel {
   readonly property var procRows: procKeys.map(function(k) { return procMap[k] }).filter(function(x) { return !!x })
   readonly property var listenRows: listenKeys.map(function(k) { return listenMap[k] }).filter(function(x) { return !!x })
   readonly property int listenHeaderIndex: ifaceKeys.length + procKeys.length
+  readonly property int newListenerFor: 3600
+  function listenerIsNew(l) {
+    if (!l || !l.firstSeen) return false
+    return (Number(snap.ts || 0) - Number(l.firstSeen)) < newListenerFor
+  }
+  readonly property int newListenerCount: {
+    var ls = snap && snap.listeners ? snap.listeners : []
+    var n = 0
+    for (var i = 0; i < ls.length; i++) if (listenerIsNew(ls[i])) n++
+    return n
+  }
   readonly property int rowCount: ifaceKeys.length + procKeys.length + 1 + listenKeys.length
   readonly property string warningsJson: JSON.stringify(snap && snap.warnings ? snap.warnings : [])
   readonly property string minorSetupJson: {
@@ -678,11 +724,122 @@ Panel {
   // with ipaddress before `tailscale set` is named. The command shown to the
   // user is the one that ends up running (cmdText), built from the same target.
   readonly property var exitNodeTarget: /^(off|[0-9a-fA-F:.]{1,45})$/
-  function actionCommandText(target) {
+  readonly property var probeTargetRe: /^[0-9a-fA-F:.]{1,45}$/
+  readonly property var ifnameRe: /^[A-Za-z0-9_.-]{1,15}$/
+  function actionCommandText(item) {
+    if (item && item.action === "probe") return "ping -c 3 -W 1 -I " + String(item.dev || "") + " " + String(item.target || "")
+    var target = String((item && item.target) || "")
     return "tailscale set --exit-node=" + (target === "off" ? "" : target)
   }
+  function actionTooltip(item) {
+    if (item && item.action === "probe") return "Runs: " + actionCommandText(item) + "\nOne click; sends three echo requests and changes nothing."
+    return "Runs: " + actionCommandText(item) + "\nTakes two clicks; nothing else on this machine changes."
+  }
+
+  // Where to ping to learn whether a link really carries traffic: the far end
+  // of the tunnel when there is one (exit node, active peer, managed-route
+  // gateway, a /32 allowed-ip), otherwise the gateway.
+  function probeTargetFor(f) {
+    if (!f || !f.active) return ""
+    var t = f.tunnel || {}
+    var gw = ""
+    var routes = f.routes || []
+    for (var i = 0; i < routes.length; i++) if (routes[i].gateway) { gw = String(routes[i].gateway); break }
+    if (f.kind === "tailscale") {
+      if (t.exitNode && t.exitNode.ips && t.exitNode.ips.length) return String(t.exitNode.ips[0])
+      var peers = t.peers || []
+      for (var p = 0; p < peers.length; p++) if (peers[p].active && peers[p].online && peers[p].ip) return String(peers[p].ip)
+      for (var q = 0; q < peers.length; q++) if (peers[q].online && peers[q].ip) return String(peers[q].ip)
+      return ""
+    }
+    if (f.kind === "zerotier") {
+      var n = t.network
+      if (n && n.routes) for (var z = 0; z < n.routes.length; z++) if (n.routes[z].via) return String(n.routes[z].via)
+      return gw
+    }
+    if (f.kind === "wireguard") {
+      if (gw) return gw
+      var wp = t.peers || []
+      for (var w = 0; w < wp.length; w++) {
+        var allowed = wp[w].allowedIps || []
+        for (var a = 0; a < allowed.length; a++) {
+          var ip = String(allowed[a])
+          if (/\/32$|\/128$/.test(ip)) return ip.split("/")[0]
+        }
+      }
+      return ""
+    }
+    return gw || String(f.gateway || "")
+  }
+  function probeItemFor(f) {
+    if (!tunnelProbe || !f) return null
+    var target = probeTargetFor(f)
+    if (!target || !probeTargetRe.test(target) || !ifnameRe.test(String(f.name))) return null
+    return { t: "Ping " + target + " through " + f.name, k: "action", action: "probe", id: "probe:" + f.name, target: target, dev: String(f.name) }
+  }
+  function probeText(pr) {
+    if (!pr) return ""
+    if (pr.running) return "pinging " + pr.target + "…"
+    var age = fmtAge(Math.max(0, Math.round(Date.now() / 1000 - Number(pr.at || 0)))) + " ago"
+    if (pr.ok) {
+      var s = "✓ " + pr.received + "/" + pr.sent + " replies from " + pr.target
+      if (pr.avgMs !== null && pr.avgMs !== undefined) s += " · avg " + pr.avgMs + " ms" + (pr.maxMs ? " · max " + pr.maxMs + " ms" : "")
+      return s + " · " + age
+    }
+    return "✗ no reply from " + pr.target + " through " + pr.dev + (pr.error ? " (" + pr.error + ")" : "") + " · " + age
+  }
+  function setProbe(dev, value) {
+    var next = {}
+    for (var k in probeResults) next[k] = probeResults[k]
+    next[dev] = value
+    probeResults = next
+  }
+  function probeCursor() {
+    var row = rowAt(cursorIndex)
+    if (row.section !== "iface") return
+    var item = probeItemFor(row.item)
+    if (item) runAction(item)
+  }
+  // A probe is read-only, so it takes one click. collect.py re-validates both
+  // arguments (interface name pattern, ipaddress) before ping is named.
+  function runProbe(item) {
+    if (!tunnelProbe) return
+    var dev = String(item.dev || "")
+    var target = String(item.target || "")
+    if (!ifnameRe.test(dev) || !probeTargetRe.test(target)) return
+    if (actionRunner.running) return
+    actionRunner.kind = "probe"
+    actionRunner.label = dev
+    actionRunner.command = [pythonBin, "-I", scriptPath, "--probe", dev, target]
+    actionRunner.running = true
+    actionWatchdog.restart()
+    setProbe(dev, { running: true, target: target, dev: dev })
+    actionStatus = "Pinging " + target + " through " + dev + "…"
+    actionStatusTimer.stop()
+  }
+  function finishProbe(exitCode) {
+    var dev = actionRunner.label
+    var raw = String(actionOut.text || "")
+    var result = null
+    if (raw.length <= 65536) {
+      try { result = JSON.parse(raw.trim()) } catch (e) { result = null }
+    }
+    if (!result || typeof result !== "object") {
+      var err = String(actionErr.text || "").trim().slice(-4096).split("\n").slice(-1)[0]
+      result = { ok: false, sent: 0, received: 0, target: (probeResults[dev] || {}).target || "", error: err || (exitCode === 0 ? "no result" : "exit code " + exitCode) }
+    }
+    result.running = false
+    result.dev = dev
+    result.at = Date.now() / 1000
+    setProbe(dev, result)
+    actionStatus = dev + ": " + probeText(result)
+    actionStatusTimer.interval = 6000
+    actionStatusTimer.restart()
+  }
   function runAction(item) {
-    if (!item || !exitNodeSwitcher) return
+    if (!item) return
+    if (item.action === "probe") { runProbe(item); return }
+    if (!exitNodeSwitcher) return
     var target = String(item.target || "")
     if (!exitNodeTarget.test(target)) return
     if (pendingActionId !== item.id) {
@@ -695,31 +852,38 @@ Panel {
     pendingActionId = ""
     pendingActionTimer.stop()
     if (actionRunner.running) return
+    actionRunner.kind = "exit"
     actionRunner.label = item.t
     actionRunner.command = [pythonBin, "-I", scriptPath, "--exit-node", target]
     actionRunner.running = true
     actionWatchdog.restart()
-    actionStatus = "Running " + actionCommandText(target) + "…"
+    actionStatus = "Running " + actionCommandText(item) + "…"
     actionStatusTimer.stop()
   }
-  // collect.py already caps and deadlines tailscale itself; this only covers
-  // the interpreter never coming back.
+  // collect.py already caps and deadlines tailscale/ping itself; this only
+  // covers the interpreter never coming back.
   Timer {
     id: actionWatchdog
     interval: 30000
     repeat: false
-    onTriggered: if (actionRunner.running) actionRunner.running = false
+    onTriggered: {
+      if (!actionRunner.running) return
+      actionRunner.running = false
+      if (actionRunner.kind === "probe") root.setProbe(actionRunner.label, { running: false, ok: false, sent: 0, received: 0, dev: actionRunner.label, target: (root.probeResults[actionRunner.label] || {}).target || "", error: "timed out", at: Date.now() / 1000 })
+    }
   }
 
   Process {
     id: actionRunner
     property string label: ""
+    property string kind: ""
     running: false
     command: []
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
       actionWatchdog.stop()
+      if (actionRunner.kind === "probe") { root.finishProbe(exitCode); return }
       var err = String(actionErr.text || "").trim().slice(-4096)
       if (exitCode === 0) {
         root.actionStatus = "Done: " + actionRunner.label
@@ -900,6 +1064,14 @@ Panel {
     if (hw.length) lines.push({ t: hw.join(" · "), k: "info" })
     lines.push({ t: "Counters: ↓ " + fmtBytes(f.rx) + " (" + f.rxPackets + " pkt) ↑ " + fmtBytes(f.tx) + " (" + f.txPackets + " pkt)" + (f.rxDrop || f.txDrop ? " · drop " + f.rxDrop + "/" + f.txDrop : ""), k: "info" })
     if (f.dns.length > 0) lines.push({ t: "DNS: " + f.dns.join(", ") + (f.dnsDefaultRoute ? " · default resolver" : "") + (f.dnsDomains.length ? " · domains " + f.dnsDomains.join(", ") : "") + (f.dnsRoutingDomains ? " · " + f.dnsRoutingDomains + " routing domains" : ""), k: "info" })
+
+    var probe = probeItemFor(f)
+    if (probe) {
+      var pr = probeResults[f.name]
+      if (pr && pr.running) probe.t += " — running…"
+      lines.push(probe)
+      if (pr && !pr.running) lines.push({ t: probeText(pr), k: pr.ok ? "item" : "warn" })
+    }
 
     if (f.routes.length > 0) {
       lines.push({ t: "Routes via " + f.name + ":", k: "head" })
@@ -1103,6 +1275,7 @@ Panel {
         if (t === "r") { root.forcePublic = true; root.refresh() }
         else if (t === "c") root.copyCursor()
         else if (t === "l") root.showListeners = !root.showListeners
+        else if (t === "p") root.probeCursor()
         else if (t === "e") root.setAllExpanded(true)
         else if (t === "w") root.setAllExpanded(false)
         else if (t === "1") root.chartRange = 3600
@@ -1171,16 +1344,36 @@ Panel {
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
-            InfoLine {
-              visible: !!root.lastEgressChange
-              label: "Changed"
-              value: root.lastEgressChange
-                     ? (root.fmtAge(Math.max(0, Math.round(Date.now() / 1000 - root.lastEgressChange.at + 0 * root.clockTick))) + " ago:  "
-                        + root.egressLabelOf(root.lastEgressChange.from) + "  →  " + root.egressLabelOf(root.lastEgressChange.to))
-                     : ""
-              urgentValue: root.egressAlert
-            }
             InfoLine { visible: root.publicIp; label: "Public"; value: root.pub ? root.publicText : (root.loaded ? "checking…" : "…"); dimValue: !root.pub || !root.pub.available || !!root.pub.stale; urgentValue: !!(root.pub && root.pub.available === false && root.pub.error) }
+            InfoLine { visible: root.egressHistoryText !== ""; label: "History"; value: root.egressHistoryText; dimValue: true }
+            InfoLine {
+              visible: root.connectivityText !== ""
+              label: "Check"
+              value: root.connectivityText
+              urgentValue: root.connectivity === "portal" || root.connectivity === "none"
+            }
+            Text {
+              visible: root.openWifi
+              textFormat: Text.PlainText
+              width: parent.width
+              leftPadding: Style.space(52)
+              text: "⚠ Open Wi-Fi without a tunnel: " + (root.defaultIface && root.defaultIface.wifi ? "\"" + root.defaultIface.wifi.ssid + "\" " : "") + "has no encryption, so anyone nearby can read what is not HTTPS"
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Repeater {
+              model: JSON.parse(root.alertsJson)
+              delegate: InfoLine {
+                required property var modelData
+                required property int index
+                label: index === 0 ? "Alerts" : ""
+                value: root.alertText(modelData)
+                urgentValue: root.alertUrgent(modelData)
+                dimValue: !root.alertUrgent(modelData) && (Date.now() / 1000 - Number(modelData.at || 0) + 0 * root.clockTick) > 3600
+              }
+            }
 
             Repeater {
               model: JSON.parse(root.warningsJson)
@@ -1352,7 +1545,7 @@ Panel {
                   font.pixelSize: Style.font.body
                 }
                 PanelSectionHeader {
-                  text: "Listening services" + (root.snap.listeners ? " (" + root.snap.listeners.length + ")" : "")
+                  text: "Listening services" + (root.snap.listeners ? " (" + root.snap.listeners.length + ")" : "") + (root.newListenerCount > 0 ? " · " + root.newListenerCount + " new" : "")
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   topPadding: 0
@@ -1415,7 +1608,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               width: parent.width
-              text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · r refresh · l listeners · e/w expand/collapse all · esc"
+              text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · p ping through link · r refresh · l listeners · e/w expand/collapse all · esc"
               color: root.dimmer
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1515,7 +1708,7 @@ Panel {
           rightPadding: detailLine.isAction ? Style.space(8) : 0
           topPadding: modelData.k === "head" ? Style.space(4) : 0
           text: detailLine.isAction
-                ? ("󰑓  " + modelData.t + (detailLine.armed ? "   — click again to confirm" : ""))
+                ? ((modelData.action === "probe" ? "󰐊  " : "󰑓  ") + modelData.t + (detailLine.armed ? "   — click again to confirm" : ""))
                 : modelData.t
           color: modelData.k === "warn" ? root.urgent
                : detailLine.isAction ? (detailLine.armed ? root.urgent : root.accentColor)
@@ -1537,7 +1730,7 @@ Panel {
 
           PanelToolTip {
             visible: actionMouse.containsMouse
-            text: root.plain("Runs: " + root.actionCommandText(String(detailLine.modelData.target || "")) + "\nTakes two clicks; nothing else on this machine changes.")
+            text: root.plain(root.actionTooltip(detailLine.modelData))
             fontFamily: root.fontFamily
           }
         }
@@ -2135,6 +2328,15 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight
+      }
+      Text {
+        textFormat: Text.PlainText
+        visible: root.listenerIsNew(listenRow.listener)
+        text: "new"
+        color: root.accentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
       }
     }
   }
