@@ -98,7 +98,7 @@ Colours follow the active Omarchy theme, light or dark:
 | Expand / collapse a row | Enter, Space, `→`/`←`, click |
 | Expand / collapse everything | `e` / `w` |
 | Chart range 1h / 6h / 24h | `1` / `2` / `3` |
-| Show listening services | `l` or click the header |
+| Show listening services | `s` or click the header |
 | Copy (interface IP / first remote address / listener address) | `c`, right click on a row |
 | Ping through the selected interface | `p`, or click the *Ping …* line in the expanded row |
 | Close | Esc |

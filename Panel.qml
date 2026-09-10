@@ -127,15 +127,15 @@ Panel {
   readonly property var latestAlert: alerts.length ? alerts[alerts.length - 1] : null
   function egressEntryLabel(e) {
     if (!e || !e.dev) return "no route"
-    return e.dev + (e.exitNode ? " via exit node " + e.exitNode : "")
+    return e.dev + (e.kind ? " (" + e.kind + ")" : "") + (e.exitNode ? " via exit node " + e.exitNode : "")
   }
-  // The last few egress transitions, newest first: "07:12 wg0 → wlp2s0".
-  readonly property string egressHistoryText: {
-    var parts = []
-    for (var i = egressLog.length - 1; i >= 1 && parts.length < 4; i--) {
-      parts.push(fmtClock(Number(egressLog[i].at || 0)) + " " + egressEntryLabel(egressLog[i - 1]) + " → " + egressEntryLabel(egressLog[i]))
+  // The last few egress transitions, newest first: "07:12  wg0 (wireguard) → wlp2s0 (wifi)".
+  readonly property string egressHistoryJson: {
+    var out = []
+    for (var i = egressLog.length - 1; i >= 1 && out.length < 3; i--) {
+      out.push(fmtClock(Number(egressLog[i].at || 0)) + "  " + egressEntryLabel(egressLog[i - 1]) + "  →  " + egressEntryLabel(egressLog[i]))
     }
-    return parts.join("   ·   ")
+    return JSON.stringify(out)
   }
   readonly property string connectivityText: {
     if (connectivity === "portal") return "captive portal — this network intercepts web traffic until you sign in"
@@ -1274,7 +1274,7 @@ Panel {
       onTextKey: function(t) {
         if (t === "r") { root.forcePublic = true; root.refresh() }
         else if (t === "c") root.copyCursor()
-        else if (t === "l") root.showListeners = !root.showListeners
+        else if (t === "s") root.showListeners = !root.showListeners   // not "l": the key catcher takes h/l as left/right
         else if (t === "p") root.probeCursor()
         else if (t === "e") root.setAllExpanded(true)
         else if (t === "w") root.setAllExpanded(false)
@@ -1345,7 +1345,16 @@ Panel {
               wrapMode: Text.WordWrap
             }
             InfoLine { visible: root.publicIp; label: "Public"; value: root.pub ? root.publicText : (root.loaded ? "checking…" : "…"); dimValue: !root.pub || !root.pub.available || !!root.pub.stale; urgentValue: !!(root.pub && root.pub.available === false && root.pub.error) }
-            InfoLine { visible: root.egressHistoryText !== ""; label: "History"; value: root.egressHistoryText; dimValue: true }
+            Repeater {
+              model: JSON.parse(root.egressHistoryJson)
+              delegate: InfoLine {
+                required property var modelData
+                required property int index
+                label: index === 0 ? "History" : ""
+                value: modelData
+                dimValue: true
+              }
+            }
             InfoLine {
               visible: root.connectivityText !== ""
               label: "Check"
@@ -1608,7 +1617,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               width: parent.width
-              text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · p ping through link · r refresh · l listeners · e/w expand/collapse all · esc"
+              text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · p ping through link · r refresh · s listening services · e/w expand/collapse all · esc"
               color: root.dimmer
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

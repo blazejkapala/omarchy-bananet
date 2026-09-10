@@ -1573,7 +1573,9 @@ def update_state(now, egress_fp, public, listeners, connectivity, wifi, egress_k
         if isinstance(old, list) and len(old) == 2 and now - float(old[1] or 0) < LISTENER_FORGET:
             known[k] = [old[0], round(now, 1)]
         else:
-            known[k] = [round(now, 1), round(now, 1)]
+            # First run: everything already existed before we started watching,
+            # so its first-seen time is unknown (0) and nothing is "new".
+            known[k] = [0 if first_run else round(now, 1), round(now, 1)]
             if not first_run and alertable_listener(l):
                 fresh.append(l)
             changed = True
