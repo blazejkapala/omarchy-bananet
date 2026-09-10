@@ -11,8 +11,8 @@ untunnelled. No root required; the widget detects what is installed and only use
 degrades gracefully, and tells you what one command would unlock.
 
 <p align="center">
-  <img src="screenshots/panel.png" width="49%" alt="Panel: egress, interfaces with sparklines, services">
-  <img src="screenshots/panel-chart-24h.png" width="49%" alt="Wi-Fi expanded: 24 h chart, routes, connections">
+  <img src="screenshots/panel.png" width="49%" alt="Panel: egress with history and alerts, interfaces with sparklines, services, listeners">
+  <img src="screenshots/panel-chart-24h.png" width="49%" alt="Wi-Fi expanded: 24 h chart, ping through the link, routes, connections">
 </p>
 
 ## Install
