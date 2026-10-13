@@ -121,6 +121,7 @@ Colours follow the active Omarchy theme, light or dark:
 | `exitNodeSwitcher` | true | offer Tailscale exit-node switching in the panel (two clicks, runs `tailscale set`) |
 | `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-bananet/`) |
 | `useSudo` | true | try `sudo -n` for the five allowlisted read-only commands (`zerotier-cli -j listnetworks`/`listpeers`, `wg show all dump`, `ss -tunpHO`, `ss -tulnpHO`); passwordless only, answer remembered 10 min |
+| `showPrivilegeSetup` | true | show the clickable cards offering optional sudo setup; set to `false` to hide the cards and their bar tooltip hints without changing data collection |
 | `showInactive` | true | list interfaces that are down (e.g. Ethernet without a cable) |
 | `showVirtual` | false | list bridges/veth (Docker etc.) |
 | `showLoopback` | false | count connections to localhost |
@@ -130,6 +131,11 @@ Colours follow the active Omarchy theme, light or dark:
 Example: `omarchy bar set banan.bananet labels '{"wg0":"MikroTik BTH"}' --json`
 
 ## Privileges — what works without root and what needs one step
+
+To hide the optional sudo setup cards, run
+`omarchy bar set banan.bananet showPrivilegeSetup false --json`.
+This only changes the display. Data that requires privileges remains unavailable
+unless the corresponding rule is installed.
 
 The collector first detects what is installed (`tailscale`, `zerotier-cli`,
 `wg`, `openvpn`, `nmcli`, `resolvectl`, `ss`, all at their fixed paths under

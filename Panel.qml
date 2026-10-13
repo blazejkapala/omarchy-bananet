@@ -71,6 +71,7 @@ Panel {
   readonly property string iconStyle: String(setting("iconStyle", "banana"))
   readonly property bool resolveNames: boolSetting("resolveNames", true)
   readonly property bool useSudo: boolSetting("useSudo", true)
+  readonly property bool showPrivilegeSetup: boolSetting("showPrivilegeSetup", true)
   readonly property bool showInactive: boolSetting("showInactive", true)
   readonly property bool showVirtual: boolSetting("showVirtual", false)
   readonly property bool showLoopback: boolSetting("showLoopback", false)
@@ -469,10 +470,12 @@ Panel {
   readonly property var setupItems: snap && snap.setup ? snap.setup : []
   readonly property var majorSetupItems: {
     var out = []
+    if (!showPrivilegeSetup) return out
     for (var i = 0; i < setupItems.length; i++) if (!setupItems[i].minor) out.push(setupItems[i])
     return out
   }
   function setupFor(kind) {
+    if (!showPrivilegeSetup) return null
     for (var i = 0; i < setupItems.length; i++) if (setupItems[i].iface === kind) return setupItems[i]
     return null
   }
@@ -634,6 +637,7 @@ Panel {
   readonly property string warningsJson: JSON.stringify(snap && snap.warnings ? snap.warnings : [])
   readonly property string minorSetupJson: {
     var out = []
+    if (!showPrivilegeSetup) return JSON.stringify(out)
     for (var i = 0; i < setupItems.length; i++) if (setupItems[i].minor) out.push(setupItems[i])
     return JSON.stringify(out)
   }

@@ -24,6 +24,7 @@
       "showLabel": false,
       "resolveNames": true,
       "useSudo": true,
+      "showPrivilegeSetup": true,
       "showInactive": true,
       "showLoopback": false,
       "showTooltip": false,
@@ -120,6 +121,12 @@
         "key": "useSudo",
         "type": "boolean",
         "label": "Try passwordless sudo for wg / zerotier-cli / ss",
+        "defaultValue": true
+      },
+      {
+        "key": "showPrivilegeSetup",
+        "type": "boolean",
+        "label": "Show clickable cards for optional sudo setup",
         "defaultValue": true
       },
       {
