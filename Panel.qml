@@ -81,6 +81,15 @@ Panel {
   readonly property bool notifyListeners: boolSetting("notifyNewListener", true)
   readonly property bool exitNodeSwitcher: boolSetting("exitNodeSwitcher", true)
   readonly property bool tunnelProbe: boolSetting("tunnelProbe", true)
+  readonly property bool showEgressSection: boolSetting("showEgressSection", true)
+  readonly property bool showInterfacesSection: boolSetting("showInterfacesSection", true)
+  readonly property bool showServicesSection: boolSetting("showServicesSection", true)
+  readonly property bool showListenersSection: boolSetting("showListenersSection", true)
+  property bool settingsOpen: false
+  readonly property string omarchyBin: "/usr/share/omarchy/bin/omarchy"
+  function setBooleanSetting(key, value) {
+    Quickshell.execDetached([omarchyBin, "bar", "set", moduleName, key, value ? "true" : "false", "--json"])
+  }
   property bool forcePublic: false     // next refresh re-checks the public IP now (manual refresh)
   readonly property var labelOverrides: {
     var v = setting("labels", null)
@@ -633,7 +642,7 @@ Panel {
     for (var i = 0; i < ls.length; i++) if (listenerIsNew(ls[i])) n++
     return n
   }
-  readonly property int rowCount: ifaceKeys.length + procKeys.length + 1 + listenKeys.length
+  readonly property int rowCount: ifaceKeys.length + procKeys.length + (showListenersSection ? 1 + listenKeys.length : 0)
   readonly property string warningsJson: JSON.stringify(snap && snap.warnings ? snap.warnings : [])
   readonly property string minorSetupJson: {
     var out = []
@@ -650,7 +659,7 @@ Panel {
   function syncRows() {
     var list = snap && snap.interfaces ? snap.interfaces : []
     var im = {}, ik = []
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; showInterfacesSection && i < list.length; i++) {
       var f = list[i]
       if (!showInactive && !f.active) continue
       if (!showVirtual && f.kind === "virtual") continue
@@ -662,7 +671,7 @@ Panel {
 
     var procs = snap && snap.processes ? snap.processes : []
     var pm = {}, pk = []
-    for (var j = 0; j < procs.length; j++) {
+    for (var j = 0; showServicesSection && j < procs.length; j++) {
       var key = procs[j].name
       if (pm[key]) key += "#" + j
       pm[key] = procs[j]
@@ -672,7 +681,7 @@ Panel {
     if (!sameKeys(pk, procKeys)) procKeys = pk
 
     var lm = {}, lk = []
-    if (showListeners) {
+    if (showListeners && showListenersSection) {
       var ls = snap && snap.listeners ? snap.listeners : []
       for (var l = 0; l < ls.length; l++) {
         var lkey = ls[l].proto + ":" + ls[l].addr + ":" + ls[l].port + ":" + ls[l].proc
@@ -688,13 +697,17 @@ Panel {
   onShowInactiveChanged: syncRows()
   onShowVirtualChanged: syncRows()
   onShowListenersChanged: syncRows()
+  onShowInterfacesSectionChanged: syncRows()
+  onShowServicesSectionChanged: syncRows()
+  onShowListenersSectionChanged: syncRows()
 
   function rowAt(idx) {
     if (idx < ifaceRows.length) return { section: "iface", item: ifaceRows[idx] }
     idx -= ifaceRows.length
     if (idx < procRows.length) return { section: "proc", item: procRows[idx] }
     idx -= procRows.length
-    if (idx === 0) return { section: "listenHeader", item: null }
+    if (showListenersSection && idx === 0) return { section: "listenHeader", item: null }
+    if (!showListenersSection) return { section: "", item: null }
     idx -= 1
     if (idx < listenRows.length) return { section: "listen", item: listenRows[idx] }
     return { section: "", item: null }
@@ -1277,6 +1290,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r") { root.forcePublic = true; root.refresh() }
+        else if (t === "t") root.settingsOpen = !root.settingsOpen
         else if (t === "c") root.copyCursor()
         else if (t === "s") root.showListeners = !root.showListeners   // not "l": the key catcher takes h/l as left/right
         else if (t === "p") root.probeCursor()
@@ -1305,6 +1319,21 @@ Panel {
           spacing: Style.space(10)
 
           PanelHero {
+            trailingControl: Component {
+              Item {
+                implicitWidth: Style.space(32)
+                implicitHeight: Style.space(32)
+                Text { anchors.centerIn: parent; text: "⚙"; color: root.foreground; font.pixelSize: Style.font.title }
+                MouseArea {
+                  id: settingsButton
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.settingsOpen = !root.settingsOpen
+                }
+                PanelToolTip { visible: settingsButton.containsMouse; text: "Settings (t)"; fontFamily: root.fontFamily }
+              }
+            }
             iconComponent: Component {
               Text {
                 textFormat: Text.PlainText
@@ -1321,8 +1350,33 @@ Panel {
             fontFamily: root.fontFamily
           }
 
+          Column {
+            visible: root.settingsOpen
+            width: parent.width
+            spacing: Style.space(6)
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader { text: "Settings"; foreground: root.foreground; fontFamily: root.fontFamily }
+            SettingsRow { settingKey: "showEgressSection"; label: "Egress section" }
+            SettingsRow { settingKey: "showInterfacesSection"; label: "Interfaces and charts" }
+            SettingsRow { settingKey: "showServicesSection"; label: "Services and connections" }
+            SettingsRow { settingKey: "showListenersSection"; label: "Listening services" }
+            SettingsRow { settingKey: "showPrivilegeSetup"; label: "Sudo setup cards" }
+            SettingsRow { settingKey: "showInactive"; label: "Inactive interfaces" }
+            SettingsRow { settingKey: "showVirtual"; label: "Virtual interfaces"; defaultValue: false }
+            SettingsRow { settingKey: "showLabel"; label: "Label in the bar"; defaultValue: false }
+            SettingsRow { settingKey: "showTooltip"; label: "Bar tooltip"; defaultValue: false }
+            SettingsRow { settingKey: "publicIp"; label: "Public IP lookup" }
+            SettingsRow { settingKey: "useSudo"; label: "Try passwordless sudo" }
+            SettingsRow { settingKey: "notifyEgressChange"; label: "Egress notifications" }
+            SettingsRow { settingKey: "notifyPublicIpChange"; label: "Public IP notifications" }
+            SettingsRow { settingKey: "notifyNewListener"; label: "New listener notifications" }
+            SettingsRow { settingKey: "exitNodeSwitcher"; label: "Tailscale exit node switch" }
+            SettingsRow { settingKey: "tunnelProbe"; label: "Ping through link" }
+          }
+
           // ---------- Egress ----------
           Column {
+            visible: root.showEgressSection
             width: parent.width
             spacing: Style.space(4)
 
@@ -1416,6 +1470,7 @@ Panel {
 
           // ---------- Interfaces ----------
           Column {
+            visible: root.showInterfacesSection
             width: parent.width
             spacing: Style.space(2)
 
@@ -1486,6 +1541,7 @@ Panel {
 
           // ---------- Services / connections ----------
           Column {
+            visible: root.showServicesSection
             width: parent.width
             spacing: Style.space(2)
 
@@ -1520,6 +1576,7 @@ Panel {
 
           // ---------- Listeners ----------
           Column {
+            visible: root.showListenersSection
             width: parent.width
             spacing: Style.space(2)
 
@@ -1621,7 +1678,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               width: parent.width
-              text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · p ping through link · r refresh · s listening services · e/w expand/collapse all · esc"
+              text: "j/k move · enter/→ expand · 1/2/3 chart range · c copy · p ping through link · r refresh · t settings · s listening services · e/w expand/collapse all · esc"
               color: root.dimmer
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1655,6 +1712,31 @@ Panel {
   }
 
   // ------------------------------------------------------------- components
+  component SettingsRow: Row {
+    id: settingRow
+    property string settingKey: ""
+    property string label: ""
+    property bool defaultValue: true
+    width: parent ? parent.width : implicitWidth
+    spacing: Style.space(12)
+    Text {
+      textFormat: Text.PlainText
+      width: settingRow.width - settingSwitch.implicitWidth - settingRow.spacing
+      text: settingRow.label
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      height: settingSwitch.implicitHeight
+      verticalAlignment: Text.AlignVCenter
+      MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.setBooleanSetting(settingRow.settingKey, !settingSwitch.checked) }
+    }
+    ToggleSwitch {
+      id: settingSwitch
+      checked: root.boolSetting(settingRow.settingKey, settingRow.defaultValue)
+      foreground: root.foreground
+      onToggled: root.setBooleanSetting(settingRow.settingKey, !checked)
+    }
+  }
   component InfoLine: Row {
     property string label: ""
     property string value: ""

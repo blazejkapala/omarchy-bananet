@@ -99,12 +99,15 @@ Colours follow the active Omarchy theme, light or dark:
 | Expand / collapse everything | `e` / `w` |
 | Chart range 1h / 6h / 24h | `1` / `2` / `3` |
 | Show listening services | `s` or click the header |
+| Settings | `t` or click the gear in the panel header |
 | Copy (interface IP / first remote address / listener address) | `c`, right click on a row |
 | Ping through the selected interface | `p`, or click the *Ping …* line in the expanded row |
 | Close | Esc |
 | Switch to a neighbouring bar panel | Tab / Shift+Tab |
 
 ## Settings (`~/.config/omarchy/shell.json`, the `banan.bananet` entry)
+
+The gear in the panel header lets you change the main visibility, data and notification settings. Changes are saved in `shell.json`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -122,6 +125,10 @@ Colours follow the active Omarchy theme, light or dark:
 | `resolveNames` | true | reverse DNS for remote addresses (cached in `~/.cache/omarchy-bananet/`) |
 | `useSudo` | true | try `sudo -n` for the five allowlisted read-only commands (`zerotier-cli -j listnetworks`/`listpeers`, `wg show all dump`, `ss -tunpHO`, `ss -tulnpHO`); passwordless only, answer remembered 10 min |
 | `showPrivilegeSetup` | true | show the clickable cards offering optional sudo setup; set to `false` to hide the cards and their bar tooltip hints without changing data collection |
+| `showEgressSection` | true | show egress, routes, DNS and alerts in the panel |
+| `showInterfacesSection` | true | show interfaces and traffic charts |
+| `showServicesSection` | true | show services and outgoing connections |
+| `showListenersSection` | true | show listening services |
 | `showInactive` | true | list interfaces that are down (e.g. Ethernet without a cable) |
 | `showVirtual` | false | list bridges/veth (Docker etc.) |
 | `showLoopback` | false | count connections to localhost |

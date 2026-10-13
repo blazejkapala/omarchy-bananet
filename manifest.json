@@ -25,6 +25,10 @@
       "resolveNames": true,
       "useSudo": true,
       "showPrivilegeSetup": true,
+      "showEgressSection": true,
+      "showInterfacesSection": true,
+      "showServicesSection": true,
+      "showListenersSection": true,
       "showInactive": true,
       "showLoopback": false,
       "showTooltip": false,
@@ -127,6 +131,30 @@
         "key": "showPrivilegeSetup",
         "type": "boolean",
         "label": "Show clickable cards for optional sudo setup",
+        "defaultValue": true
+      },
+      {
+        "key": "showEgressSection",
+        "type": "boolean",
+        "label": "Show egress and route details in the panel",
+        "defaultValue": true
+      },
+      {
+        "key": "showInterfacesSection",
+        "type": "boolean",
+        "label": "Show interfaces and traffic charts in the panel",
+        "defaultValue": true
+      },
+      {
+        "key": "showServicesSection",
+        "type": "boolean",
+        "label": "Show services and connections in the panel",
+        "defaultValue": true
+      },
+      {
+        "key": "showListenersSection",
+        "type": "boolean",
+        "label": "Show listening services in the panel",
         "defaultValue": true
       },
       {
